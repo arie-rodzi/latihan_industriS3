@@ -22,6 +22,63 @@ def require_role(roles):
         st.error("Akses tidak dibenarkan. Sila log masuk sebagai Penyelia Industri.")
         st.stop()
 
+# --- Helper: pastikan skema jadual bli05_industry serasi & INSERT dinamik ---
+def ensure_bli05_schema(conn):
+    """Tambah mana-mana kolum yang tiada pada jadual bli05_industry."""
+    needed = {
+        "student_user_id": "INTEGER",
+        "ind_supervisor_id": "INTEGER",
+        "term_id": "INTEGER",
+        "items_json": "TEXT",
+        "js_total": "REAL",
+        "weighted_30": "REAL",
+        "overall_decision": "TEXT",
+        "comments": "TEXT",
+        "submitted_at": "TEXT",
+        "updated_at": "TEXT"
+    }
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(bli05_industry)")
+    have = {r[1] for r in cur.fetchall()}
+    missing = [c for c in needed if c not in have]
+    for col in missing:
+        cur.execute(f"ALTER TABLE bli05_industry ADD COLUMN {col} {needed[col]}")
+    if missing:
+        conn.commit()
+
+def insert_bli05(conn, data: dict, draft: bool):
+    """
+    data = {
+      'student_user_id', 'ind_supervisor_id', 'term_id',
+      'items_json', 'js_total', 'weighted_30', 'overall_decision', 'comments'
+    }
+    draft=True  -> submitted_at = NULL
+    draft=False -> submitted_at = datetime('now')
+    Always sets updated_at = datetime('now')
+    """
+    ensure_bli05_schema(conn)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(bli05_industry)")
+    cols_exist = {r[1] for r in cur.fetchall()}
+
+    base_cols = [
+        "student_user_id","ind_supervisor_id","term_id",
+        "items_json","js_total","weighted_30","overall_decision","comments"
+    ]
+    use_cols = [c for c in base_cols if c in cols_exist]
+
+    submitted_expr = "NULL" if draft else "datetime('now')"
+    add_sub = "submitted_at" in cols_exist
+    add_upd = "updated_at" in cols_exist
+
+    cols_sql = ", ".join(use_cols + (["submitted_at"] if add_sub else []) + (["updated_at"] if add_upd else []))
+    qmarks   = ", ".join(["?"]*len(use_cols) + ([submitted_expr] if add_sub else []) + (["datetime('now')"] if add_upd else []))
+
+    sql = f"INSERT INTO bli05_industry ({cols_sql}) VALUES ({qmarks})"
+    params = [data[c] for c in use_cols]
+    cur.execute(sql, params)
+    conn.commit()
+
 # ================================ LOGIN =================================
 if "auth" not in st.session_state:
     st.session_state.auth = None
@@ -58,10 +115,10 @@ with get_conn() as conn:
             student_user_id INTEGER NOT NULL,
             ind_supervisor_id INTEGER NOT NULL,
             term_id INTEGER NOT NULL,
-            items_json TEXT,                 -- simpan skor item (dict)
-            js_total REAL DEFAULT 0,         -- jumlah skor mentah (JS)
-            weighted_30 REAL DEFAULT 0,      -- markah ditimbang 30%
-            overall_decision TEXT,           -- LULUS / GAGAL / TIDAK LENGKAP
+            items_json TEXT,
+            js_total REAL DEFAULT 0,
+            weighted_30 REAL DEFAULT 0,
+            overall_decision TEXT,
             comments TEXT,
             submitted_at TEXT,
             updated_at TEXT DEFAULT (datetime('now'))
@@ -79,6 +136,8 @@ with get_conn() as conn:
         cur.execute("ALTER TABLE logbook ADD COLUMN ind_commented_at TEXT")
 
     conn.commit()
+    # Self-heal: pastikan skema BLI-05 lengkap walaupun DB lama
+    ensure_bli05_schema(conn)
 
 # ============================== TERM SEMASA ==============================
 with get_conn() as conn:
@@ -284,36 +343,35 @@ with st.expander(f"👷 {stu_label}", expanded=True):
 
         details_json = json.dumps(scores, ensure_ascii=False)
 
+        payload = {
+            "student_user_id": stu_id,
+            "ind_supervisor_id": user['user_id'],
+            "term_id": term_id,
+            "items_json": details_json,
+            "js_total": float(js_total),
+            "weighted_30": float(weighted_30),
+            "overall_decision": decision,
+            "comments": comments
+        }
+
         cX, cY = st.columns(2)
         if cX.button("💾 Simpan Draf (BLI-05)", key=f"draf05_{stu_id}"):
-            with get_conn() as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO bli05_industry(
-                        student_user_id, ind_supervisor_id, term_id,
-                        items_json, js_total, weighted_30, overall_decision, comments,
-                        submitted_at, updated_at
-                    ) VALUES (?,?,?,?,?,?,?, ?, NULL, datetime('now'))
-                """, (stu_id, user['user_id'], term_id,
-                      details_json, js_total, weighted_30, decision, comments))
-                conn.commit()
-            st.success("Draf BLI-05 disimpan.")
-            st.rerun()
+            try:
+                with get_conn() as conn:
+                    insert_bli05(conn, payload, draft=True)
+                st.success("Draf BLI-05 disimpan.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Gagal simpan draf: {type(e).__name__}: {e}")
 
         if cY.button("✅ Hantar (Muktamad BLI-05)", key=f"hantar05_{stu_id}"):
-            with get_conn() as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO bli05_industry(
-                        student_user_id, ind_supervisor_id, term_id,
-                        items_json, js_total, weighted_30, overall_decision, comments,
-                        submitted_at, updated_at
-                    ) VALUES (?,?,?,?,?,?,?, ?, datetime('now'), datetime('now'))
-                """, (stu_id, user['user_id'], term_id,
-                      details_json, js_total, weighted_30, decision, comments))
-                conn.commit()
-            st.success("Penilaian BLI-05 dihantar.")
-            st.rerun()
+            try:
+                with get_conn() as conn:
+                    insert_bli05(conn, payload, draft=False)
+                st.success("Penilaian BLI-05 dihantar.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Gagal hantar: {type(e).__name__}: {e}")
 
 # ================================ LOGOUT ================================
 st.divider()
