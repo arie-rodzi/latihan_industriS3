@@ -91,7 +91,7 @@ def require_cols(df: pd.DataFrame, cols: list[str]) -> tuple[bool, str]:
 
 ensure_schema()
 
-# =============== Seeder: 25 pelajar setiap kelas + industri ≤2 pelajar/sv ===============
+# =============== Seeder: 25 pelajar/kelas + industri ≤2 pelajar/sv ===============
 def seed_or_fix_classes_for_program(program_code: str, term_id: int) -> str:
     target_per_class = 25
     secA, secB = f"{program_code}7A", f"{program_code}7B"
@@ -182,7 +182,6 @@ def seed_or_fix_classes_for_program(program_code: str, term_id: int) -> str:
                     sv_ids.append(cur.lastrowid)
 
             # Padanan industri round-robin ≤2
-            # Padam hanya assignment INDUSTRI lama utk kelas ini (supaya susun semula ikut ≤2)
             cur.execute("""
                 DELETE FROM supervisor_assignments
                 WHERE term_id=? AND program_code=? AND student_user_id IN (
@@ -192,7 +191,6 @@ def seed_or_fix_classes_for_program(program_code: str, term_id: int) -> str:
 
             counts = [0]*len(sv_ids); idx = 0
             for _, r in df_stu.iterrows():
-                # cari penyelia yang masih <2
                 tries = 0
                 while tries < len(sv_ids) and counts[idx] >= max_per_sv:
                     idx = (idx + 1) % len(sv_ids); tries += 1
@@ -255,16 +253,18 @@ with get_conn() as conn:
     sql_roster = """
         SELECT 
             u.user_id,
-            u.student_id            AS no_pelajar,
-            u.full_name             AS nama_pelajar,
-            u.program_code          AS program,
+            u.student_id                AS no_pelajar,
+            u.full_name                 AS nama_pelajar,
+            u.program_code              AS program,
             COALESCE(u.class_section,'-') AS kelas,
-            COALESCE(p.org_name,'-')     AS organisasi,
-            COALESCE(ind.full_name,'(tiada)')  AS penyelia_industri
+            COALESCE(p.org_name,'-')       AS organisasi,
+            COALESCE(ind.full_name,'(tiada)')  AS penyelia_industri,
+            COALESCE(acad.full_name,'(belum ditetapkan)') AS penyelia_akademik
         FROM users u
         LEFT JOIN supervisor_assignments sa 
           ON sa.student_user_id=u.user_id AND sa.term_id=?
-        LEFT JOIN users ind  ON ind.user_id  = sa.ind_sv_user_id
+        LEFT JOIN users ind   ON ind.user_id  = sa.ind_sv_user_id
+        LEFT JOIN users acad  ON acad.user_id = sa.acad_sv_user_id
         LEFT JOIN placements p 
           ON p.student_id=u.user_id AND p.term_id=?
         WHERE u.role_id=1 AND u.program_code=? AND u.class_section=?
@@ -274,12 +274,12 @@ with get_conn() as conn:
 
 st.caption(f"Bilangan pelajar: **{len(df_roster)}**")
 st.dataframe(
-    df_roster[["no_pelajar","nama_pelajar","program","kelas","organisasi","penyelia_industri"]],
+    df_roster[["no_pelajar","nama_pelajar","program","kelas","organisasi","penyelia_industri","penyelia_akademik"]],
     use_container_width=True, hide_index=True
 )
 st.download_button(
     "⬇️ Muat turun senarai pelajar (CSV)",
-    data=df_to_csv_bytes(df_roster[["no_pelajar","nama_pelajar","program","kelas","organisasi","penyelia_industri"]]),
+    data=df_to_csv_bytes(df_roster[["no_pelajar","nama_pelajar","program","kelas","organisasi","penyelia_industri","penyelia_akademik"]]),
     file_name=f"senarai_pelajar_{kelas.replace(' ','_')}.csv",
     mime="text/csv"
 )
@@ -287,23 +287,25 @@ st.download_button(
 st.divider()
 
 # =============== Muat naik Pensyarah & PADANAN (kelas) ===============
-st.header("🧑‍🏫 Muat Naik Pensyarah Akademik & Jana Padanan (Kelas ini)")
-st.caption("**Templat (Excel/CSV)**: lajur **sv_email, full_name, max_students**.")
+st.header("🏫 Muat Naik Pensyarah Akademik & Jana Padanan (Kelas ini)")
+st.caption("Format fail (CSV/Excel): lajur **sv_email, full_name, max_students**.")
 
-# --- FILE TEMPLET PENSYARAH AKADEMIK (CSV) ---
-tmpl_sv = pd.DataFrame({
-    "sv_email":    ["pensyarah01@uitm.edu.my", "pensyarah02@uitm.edu.my", "pensyarah03@uitm.edu.my"],
-    "full_name":   ["Pensyarah 01", "Pensyarah 02", "Pensyarah 03"],
-    "max_students":["8","8","9"]  # jumlah kuota contoh
-})
-st.download_button(
-    "📥 Muat turun templat Pensyarah (CSV)",
-    data=df_to_csv_bytes(tmpl_sv),
-    file_name=f"template_pensyarah_{program_managed}_{kelas}.csv",
-    mime="text/csv"
-)
+# (Opsyenal) contoh templat – letak dalam expander supaya fokus UI ialah MUAT NAIK
+with st.expander("Perlu templat contoh? (opsyenal)"):
+    tmpl_sv = pd.DataFrame({
+        "sv_email":    ["pensyarah01@uitm.edu.my", "pensyarah02@uitm.edu.my", "pensyarah03@uitm.edu.my"],
+        "full_name":   ["Pensyarah 01", "Pensyarah 02", "Pensyarah 03"],
+        "max_students":["8","8","9"]
+    })
+    st.download_button(
+        "📥 Muat turun templat contoh (CSV)",
+        data=df_to_csv_bytes(tmpl_sv),
+        file_name=f"template_pensyarah_{program_managed}_{kelas}.csv",
+        mime="text/csv"
+    )
 
-up_acad = st.file_uploader("Muat naik senarai pensyarah (CSV/XLSX) — padanan untuk kelas ini", key="acad_csv")
+# ✅ Fokus: MUAT NAIK
+up_acad = st.file_uploader("Muat **naik** senarai pensyarah (CSV/XLSX) — padanan untuk kelas ini", key="acad_csv")
 df_acad = read_any_table(up_acad)
 if not df_acad.empty:
     ok, miss = require_cols(df_acad, ["sv_email","full_name"])
@@ -328,7 +330,7 @@ def get_or_create_user(email, full_name, role_id, program_code=None):
         conn.commit()
         return cur.lastrowid
 
-if st.button("⚖️ Jana & Simpan Padanan Akademik (kelas ini)"):
+if st.button("⚖️ Jana & Simpan Padanan Akademik (kelas ini)", type="primary"):
     with get_conn() as conn:
         df_students = pd.read_sql_query("""
           SELECT user_id, student_id, full_name
@@ -340,8 +342,9 @@ if st.button("⚖️ Jana & Simpan Padanan Akademik (kelas ini)"):
     if df_students.empty:
         st.warning("Tiada pelajar untuk dipadankan dalam kelas ini.")
     elif df_acad.empty:
-        st.warning("Muat naik senarai pensyarah dahulu.")
+        st.warning("Sila muat **naik** fail pensyarah dahulu.")
     else:
+        # Round-robin berdasarkan max_students
         df_sv = df_acad.copy()
         df_sv["max_students"] = pd.to_numeric(df_sv["max_students"], errors="coerce").fillna(999).astype(int)
         df_sv["assigned"] = 0
@@ -362,36 +365,26 @@ if st.button("⚖️ Jana & Simpan Padanan Akademik (kelas ini)"):
             df_sv.at[df_sv.index[idx], "assigned"] += 1
             idx = (idx + 1) % n
 
-        df_assigned = pd.DataFrame(assigned)
-
-        # Simpan/kemas kini assignment AKADEMIK (kekalkan industri sedia ada)
+        # Simpan: KEMAS KINI acad_sv_user_id sahaja (industri dikekalkan)
         with get_conn() as conn:
             cur = conn.cursor()
-            for _, r in df_assigned.iterrows():
+            for r in assigned:
                 acad_id = get_or_create_user(r["acad_sv_email"], r["acad_sv_name"], 3, program_code=program_managed)
-                # jika sudah ada baris supervisor_assignments pelajar ini → UPDATE acad_sv_user_id sahaja
-                cur.execute("""SELECT id, ind_sv_user_id FROM supervisor_assignments
+                cur.execute("""SELECT id FROM supervisor_assignments
                                WHERE student_user_id=? AND term_id=? LIMIT 1""",
-                            (int(r["student_user_id"]), term_id))
+                            (r["student_user_id"], term_id))
                 ex = cur.fetchone()
                 if ex:
-                    cur.execute("""UPDATE supervisor_assignments
-                                   SET acad_sv_user_id=?, updated_at=datetime('now')
-                                   WHERE id=?""", (acad_id, int(ex[0])))
+                    cur.execute("UPDATE supervisor_assignments SET acad_sv_user_id=?, updated_at=datetime('now') WHERE id=?",
+                                (acad_id, int(ex[0])))
                 else:
                     cur.execute("""INSERT INTO supervisor_assignments
                                    (student_user_id, acad_sv_user_id, ind_sv_user_id, program_code, term_id, assigned_at)
                                    VALUES (?,?,?,?,?, datetime('now'))""",
-                                (int(r["student_user_id"]), acad_id, None, program_managed, term_id))
+                                (r["student_user_id"], acad_id, None, program_managed, term_id))
             conn.commit()
 
-        st.success(f"Padanan akademik disimpan untuk kelas {kelas}.")
-        st.download_button(
-            "⬇️ Muat turun CSV padanan",
-            data=df_to_csv_bytes(df_assigned[["student_id","acad_sv_email","acad_sv_name"]]),
-            file_name=f"padanan_akademik_{kelas.replace(' ','_')}.csv",
-            mime="text/csv"
-        )
+        st.success(f"Padanan akademik disimpan untuk kelas {kelas}. Jadual pelajar kini memaparkan kolum 'penyelia_akademik'.")
         st.rerun()
 
 st.divider()
