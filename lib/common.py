@@ -70,86 +70,97 @@ def term_label(conn):
     except Exception:
         return "-"
 
-# ---------------- DOCX helpers (robust, all parts) ----------------
-def _compile_token_patterns(mapping_keys):
-    """
-    Build regex patterns for each KEY to match:
-      {{ KEY }}, « KEY », << KEY >>
-    with optional spaces around the KEY.
-    """
-    patterns = {}
-    for k in mapping_keys:
-        # escape key for regex
-        key = re.escape(k)
-        patterns[k] = [
-            re.compile(r"\{\{\s*" + key + r"\s*\}\}"),      # {{ KEY }}
-            re.compile(r"«\s*" + key + r"\s*»"),            # « KEY »
-            re.compile(r"<<\s*" + key + r"\s*>>"),          # << KEY >>
-        ]
-    return patterns
+# ---------------- DOCX helpers (robust) ----------------
+from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
-def _replace_in_text_node(txt, patterns, values_by_key):
-    """
-    Replace placeholders in a single text node string.
-    """
-    if txt is None:
-        return txt
-    out = txt
+def _compile_token_patterns(keys):
+    """Build regex patterns for {{KEY}}, «KEY», <<KEY>> with optional spaces."""
+    pats = {}
+    for k in keys:
+        kk = re.escape(k)
+        pats[k] = [
+            re.compile(r"\{\{\s*"+kk+r"\s*\}\}"),   # {{ KEY }}
+            re.compile(r"«\s*"+kk+r"\s*»"),         # « KEY »
+            re.compile(r"<<\s*"+kk+r"\s*>>"),       # << KEY >>
+        ]
+    return pats
+
+def _replace_text(text, patterns, values):
+    if text is None:
+        return text
+    out = text
     for k, regs in patterns.items():
-        val = "" if values_by_key.get(k) is None else str(values_by_key[k])
+        val = "" if values.get(k) is None else str(values[k])
         for rgx in regs:
             out = rgx.sub(val, out)
     return out
 
-def _replace_in_part_xml(part, patterns, values_by_key):
+def _rewrite_paragraph(p, patterns, values):
     """
-    Replace in all w:t nodes of a given part (body/header/footer/etc).
-    This catches paragraphs, tables, headers/footers, and most text boxes.
+    Join ALL text in p (across runs/w:t), do replacements,
+    then rebuild the paragraph with a single run (preserving xml:space).
+    """
+    # collect all w:t text in this paragraph
+    t_nodes = p.xpath(".//w:t", namespaces=p.nsmap)
+    original = "".join([t.text or "" for t in t_nodes])
+    replaced = _replace_text(original, patterns, values)
+    if replaced == original:
+        return  # nothing to change
+
+    # remove all runs <w:r>
+    r_nodes = p.xpath("./w:r", namespaces=p.nsmap)
+    for r in r_nodes:
+        p.remove(r)
+
+    # create a new run with the replaced text
+    r = OxmlElement("w:r")
+    t = OxmlElement("w:t")
+    t.set(qn("xml:space"), "preserve")  # keep spaces
+    t.text = replaced
+    r.append(t)
+    p.append(r)
+
+def _process_part(part, patterns, values):
+    """
+    Process all paragraphs in a docx part (body, header, footer, drawing parts).
+    Works even if tokens were split across multiple runs.
     """
     try:
-        from docx.oxml.ns import qn
-        # All text nodes
-        t_nodes = part.element.xpath(".//w:t", namespaces=part.element.nsmap)
-        for t in t_nodes:
-            t.text = _replace_in_text_node(t.text, patterns, values_by_key)
+        # all paragraphs anywhere in this part
+        p_nodes = part.element.xpath(".//w:p", namespaces=part.element.nsmap)
+        for p in p_nodes:
+            _rewrite_paragraph(p, patterns, values)
     except Exception:
         pass
 
-def _replace_runs_with_placeholders(doc, mapping: dict):
-    """
-    Replace placeholders across ALL document parts:
-    - main document body
-    - headers & footers of all sections
-    - and any related parts that expose XML with w:t nodes (e.g., text boxes)
-    """
+def _replace_placeholders_all_parts(doc, mapping):
     patterns = _compile_token_patterns(mapping.keys())
-
     # main body
-    _replace_in_part_xml(doc.part, patterns, mapping)
-
-    # headers/footers of each section
+    _process_part(doc.part, patterns, mapping)
+    # headers/footers
     for section in doc.sections:
         if section.header and getattr(section.header, "part", None):
-            _replace_in_part_xml(section.header.part, patterns, mapping)
+            _process_part(section.header.part, patterns, mapping)
         if section.footer and getattr(section.footer, "part", None):
-            _replace_in_part_xml(section.footer.part, patterns, mapping)
-
-    # other related parts (e.g., text boxes can live in separate drawing parts)
+            _process_part(section.footer.part, patterns, mapping)
+    # related parts (e.g. text boxes)
     for rel in list(getattr(doc.part, "related_parts", {}).values()):
         if hasattr(rel, "element"):
-            _replace_in_part_xml(rel, patterns, mapping)
+            _process_part(rel, patterns, mapping)
 
 def render_docx_from_template(template_path: str, mapping: dict) -> bytes:
     """
     Load a .docx template and replace placeholders with mapping values.
-    Supports tokens in {{KEY}}, «KEY», <<KEY>> formats (with optional spaces).
-    Replaces in body, tables, headers/footers, and most text boxes.
+    - Supports {{KEY}}, «KEY», <<KEY>> (spaces tolerated)
+    - Works in body, tables, headers/footers, and most text boxes
+    - Merges paragraph runs so split tokens are still replaced
     """
-    from docx import Document
     if not os.path.exists(template_path):
         raise FileNotFoundError(template_path)
     doc = Document(template_path)
-    _replace_runs_with_placeholders(doc, mapping)
+    _replace_placeholders_all_parts(doc, mapping)
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
