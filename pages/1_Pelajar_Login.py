@@ -19,9 +19,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SQL_PATH = os.path.join(BASE_DIR, "..", "init_mytimes_fyp.sql")
 
 try:
-    ensure_db(SQL_PATH)  # pastikan DB + skema wujud
+    ensure_db(SQL_PATH)
 except Exception as e:
-    st.error(f"Ralat DB: {e}"); st.stop()
+    st.error(f"Ralat DB: {e}")
+    st.stop()
 
 # -------------------- Guard util --------------------
 def require_role(roles):
@@ -196,7 +197,6 @@ st.divider()
 # -------------------- Logbook Mingguan --------------------
 st.markdown("## 📒 Logbook Mingguan")
 
-# (Opsyenal) tarik tarikh mula term
 term_start = None
 try:
     if not df_term.empty and df_term.iloc[0]["start_date"]:
@@ -281,7 +281,6 @@ st.markdown("## 📄 Surat Permohonan & Penempatan (Auto-isi)")
 tmpl_perm = os.path.join(BASE_DIR, "..", "templates", "SLI01_Surat_Permohonan.docx")
 tmpl_sli3 = os.path.join(BASE_DIR, "..", "templates", "SLI03_Surat_Penempatan.docx")
 
-# Kumpul data: profil, BLI-01 (data_json), BLI-03 (placements terkini)
 with get_conn() as conn:
     u = pd.read_sql_query(
         "SELECT full_name, student_id, program_code FROM users WHERE user_id=?",
@@ -306,21 +305,42 @@ with get_conn() as conn:
 
 today_str = datetime.date.today().strftime("%d %b %Y")
 
-# --- Pemetaan SLI01 (guna nilai yang telah diisi; jika kosong, biar kosong) ---
-student_name = (b1.get("nama") or u["full_name"])  # guna nama diisi jika ada
+# --- Nilai yang akan dipetakan ---
+student_name = (b1.get("nama") or u["full_name"])
+program_val  = (b1.get("program") or u["program_code"] or "")
+noic_val     = (b1.get("no_ic") or "")
+notel_val    = (b1.get("no_tel") or "")
+alamat_val   = (b1.get("alamat") or "")
+guardian_val = (b1.get("guardian") or "")
+guardian_tel_val = (b1.get("guardian_tel") or "")
+
+# --- Pemetaan SLI01 (sokong token baharu & legasi; termasuk versi « ... ») ---
 mapping_base = {
+    # gaya baharu (ringkas)
     "NAMA": student_name,
     "NOPELAJAR": u["student_id"] or "",
-    "PROGRAM": (b1.get("program") or u["program_code"] or ""),
+    "PROGRAM": program_val,
     "TARIKH": today_str,
-    "ALAMAT": b1.get("alamat", ""),
-    "NOIC": b1.get("no_ic", ""),
-    "NOTEL": b1.get("no_tel", ""),
-    "GUARDIAN": b1.get("guardian", ""),
-    "GUARDIAN_TEL": b1.get("guardian_tel", ""),
+    "ALAMAT": alamat_val,
+    "NOIC": noic_val,
+    "NOTEL": notel_val,
+    "GUARDIAN": guardian_val,
+    "GUARDIAN_TEL": guardian_tel_val,
 }
+mapping_legacy = {
+    # gaya legasi tanpa & dengan guillemets
+    "NAMA_PENUH_HURUF_BESAR": student_name.upper(),
+    "NOMBOR_KAD_PENGENALAN":  noic_val,
+    "NOMBOR_ID_PELAJAR":      u["student_id"] or "",
+    "NAMA_PROGRAM":           program_val,
+    "«NAMA_PENUH_HURUF_BESAR»": student_name.upper(),
+    "«NOMBOR_KAD_PENGENALAN»":  noic_val,
+    "«NOMBOR_ID_PELAJAR»":      u["student_id"] or "",
+    "«NAMA_PROGRAM»":           program_val,
+}
+mapping_sli01 = {**mapping_base, **mapping_legacy}
 
-# --- Pemetaan SLI03 (bergantung pada BLI-03) ---
+# --- Pemetaan SLI03 ---
 mapping_sli3 = {
     **mapping_base,
     "ORG": plc_data.get("org_name", ""),
@@ -330,15 +350,13 @@ mapping_sli3 = {
     "ORG_PHONE": plc_data.get("contact_phone", ""),
 }
 
-# =============== Polisi kelayakan muat turun SLI01 ===============
+# --- Polisi kelayakan muat turun SLI01 (maks 2 medan kosong) ---
 required_fields = ["nama", "no_ic", "no_tel", "alamat", "program", "guardian", "guardian_tel"]
 allowed_blanks = 2
-
-filled = {f: (bool((b1.get(f) or "").strip())) for f in required_fields}
+filled = {f: bool((b1.get(f) or "").strip()) for f in required_fields}
 missing_fields = [f for f, ok in filled.items() if not ok]
 can_download_sli01 = (len(missing_fields) <= allowed_blanks)
 
-# Status lembut (tiada merah)
 sli01_status = f"Medan diisi: {len(required_fields) - len(missing_fields)}/{len(required_fields)}. " \
                f"Boleh tinggal kosong hingga {allowed_blanks} medan."
 if can_download_sli01:
@@ -350,8 +368,7 @@ else:
             "nama":"Nama Penuh", "no_ic":"No. IC", "no_tel":"No. Telefon", "alamat":"Alamat",
             "program":"Kod Program", "guardian":"Nama Penjaga/Waris", "guardian_tel":"Telefon Penjaga/Waris"
         }
-        senarai = ", ".join(labels.get(m, m) for m in missing_fields)
-        st.caption(f"Masih kosong: {senarai}")
+        st.caption("Masih kosong: " + ", ".join(labels.get(m, m) for m in missing_fields))
 
 cA, cB = st.columns(2)
 with cA:
@@ -359,7 +376,7 @@ with cA:
         st.error("Template SLI01 tidak ditemui. Letak di `templates/SLI01_Surat_Permohonan.docx`.")
     else:
         try:
-            buf = render_docx_from_template(tmpl_perm, mapping_base)
+            buf = render_docx_from_template(tmpl_perm, mapping_sli01)
             st.download_button(
                 "✨ Muat Turun Surat Permohonan (Auto-isi)",
                 buf,
