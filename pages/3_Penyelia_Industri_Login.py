@@ -1,34 +1,28 @@
-# pages/3_Penyelia_Industri.py
+# pages/3_Penyelia_Industri_Login.py
 import os, json
 import pandas as pd
 import streamlit as st
 from lib.common import ensure_db, auth_email_or_sid, get_conn, one, term_label
 
-# ------------------------------------------------------------
-# Setup & Init
-# ------------------------------------------------------------
+# ================================ SETUP =================================
 st.set_page_config(page_title="Penyelia Industri", page_icon="🏭", layout="wide")
 st.title("Portal Penyelia Industri")
 
+# Pastikan init SQL dijalankan (guna path relatif ke root projek)
 try:
-    # gunakan skrip init yang sama seperti app lain
     ensure_db(os.path.join(os.path.dirname(__file__), "..", "init_mytimes_fyp.sql"))
 except Exception as e:
     st.error(f"Ralat DB: {e}")
     st.stop()
 
-# ------------------------------------------------------------
-# Guard util
-# ------------------------------------------------------------
+# ============================== GUARD UTIL ===============================
 def require_role(roles):
     aut = st.session_state.get("auth")
     if not aut or aut.get("role_name") not in roles:
         st.error("Akses tidak dibenarkan. Sila log masuk sebagai Penyelia Industri.")
         st.stop()
 
-# ------------------------------------------------------------
-# Login
-# ------------------------------------------------------------
+# ================================ LOGIN =================================
 if "auth" not in st.session_state:
     st.session_state.auth = None
 
@@ -47,29 +41,26 @@ if not st.session_state.auth:
             st.rerun()
     st.stop()
 
-# ------------------------------------------------------------
-# Role guard & user info
-# ------------------------------------------------------------
+# ============================= ROLE & USER ===============================
 require_role(["ind_sv"])
 user = st.session_state.auth
 st.success(f"Log masuk sebagai {user['full_name']}")
 
-# ------------------------------------------------------------
-# DB bootstrap (pastikan kolum yang diperlukan wujud)
-# ------------------------------------------------------------
+# ============================= DB BOOTSTRAP ==============================
+# Pastikan jadual & kolum penting wujud
 with get_conn() as conn:
     cur = conn.cursor()
 
-    # Jadual BLI-05 (jika belum wujud)
+    # Jadual BLI-05 (Penyelia Industri)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bli05_industry(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             student_user_id INTEGER NOT NULL,
             ind_supervisor_id INTEGER NOT NULL,
             term_id INTEGER NOT NULL,
-            items_json TEXT,                 -- simpan skor item (dictionary)
+            items_json TEXT,                 -- simpan skor item (dict)
             js_total REAL DEFAULT 0,         -- jumlah skor mentah (JS)
-            weighted_30 REAL DEFAULT 0,      -- markah ditimbang ke 30%
+            weighted_30 REAL DEFAULT 0,      -- markah ditimbang 30%
             overall_decision TEXT,           -- LULUS / GAGAL / TIDAK LENGKAP
             comments TEXT,
             submitted_at TEXT,
@@ -77,36 +68,31 @@ with get_conn() as conn:
         )
     """)
 
-    # Pastikan kolum komen industri pada logbook ada
+    # Kolum komen industri pada logbook
     cur.execute("PRAGMA table_info(logbook)")
-    log_cols = {r[1] for r in cur.fetchall()}
-    if "ind_comment" not in log_cols:
+    cols = {r[1] for r in cur.fetchall()}
+    if "ind_comment" not in cols:
         cur.execute("ALTER TABLE logbook ADD COLUMN ind_comment TEXT")
-    if "ind_commented_by" not in log_cols:
+    if "ind_commented_by" not in cols:
         cur.execute("ALTER TABLE logbook ADD COLUMN ind_commented_by INTEGER")
-    if "ind_commented_at" not in log_cols:
+    if "ind_commented_at" not in cols:
         cur.execute("ALTER TABLE logbook ADD COLUMN ind_commented_at TEXT")
 
     conn.commit()
 
-# ------------------------------------------------------------
-# Term semasa
-# ------------------------------------------------------------
+# ============================== TERM SEMASA ==============================
 with get_conn() as conn:
-    tlabel = term_label(conn)
+    tlabel = term_label(conn)  # contoh: "Oct 2025 (2025-10-01 → 2026-02-28)"
     df_term = pd.read_sql_query("SELECT term_id FROM terms ORDER BY term_id DESC LIMIT 1", conn)
 term_id = int(df_term.iloc[0]["term_id"]) if not df_term.empty else None
 
-cols_top = st.columns(3)
-cols_top[0].metric("Sesi", tlabel or "-")
+c1, c2 = st.columns([1, 3])
+c1.metric("Sesi", tlabel or "-")
 if not term_id:
     st.warning("Tiada term aktif.")
     st.stop()
 
-# ------------------------------------------------------------
-# Dapatkan senarai pelajar di bawah seliaan industri pengguna ini
-# (guna jadual supervisor_assignments seperti yang dinyatakan)
-# ------------------------------------------------------------
+# ====================== SENARAI PELAJAR DISELIA (IND) ====================
 with get_conn() as conn:
     df_stu = pd.read_sql_query(
         """
@@ -131,7 +117,8 @@ with get_conn() as conn:
         """
         SELECT COUNT(1)
         FROM reporting_in r
-        JOIN supervisor_assignments sa ON sa.student_user_id=r.student_id AND sa.term_id=r.term_id
+        JOIN supervisor_assignments sa
+          ON sa.student_user_id=r.student_id AND sa.term_id=r.term_id
         WHERE sa.ind_sv_user_id=? AND sa.term_id=?
         """,
         (user['user_id'], term_id)
@@ -141,38 +128,38 @@ with get_conn() as conn:
         (user['user_id'], term_id)
     ) or 0
 
-cols_mid = st.columns(3)
-cols_mid[0].metric("Pelajar di bawah anda", f"{assigned}")
-cols_mid[1].metric("Lapor Diri (BLI-04)", f"{reported}")
-cols_mid[2].metric("BLI-05 dihantar", f"{bli05_done}")
+c3, c4, c5 = st.columns(3)
+c3.metric("Pelajar di bawah anda", f"{assigned}")
+c4.metric("Lapor Diri (BLI-04)", f"{reported}")
+c5.metric("BLI-05 dihantar", f"{bli05_done}")
 
 st.subheader("Pelajar Diselia (Industri)")
 st.dataframe(df_stu, use_container_width=True)
 st.divider()
 
-# ------------------------------------------------------------
-# Pilih seorang pelajar (default cuba pilih Ali jika ada)
-# ------------------------------------------------------------
+# ========================== PILIH SEORANG PELAJAR ========================
 options = [
     (int(r.user_id), f"{r.student_id} — {r.full_name} ({r.program_code or '-'})")
     for _, r in df_stu.iterrows()
 ]
 default_idx = 0
 for i, (_, label) in enumerate(options):
-    if "ali" in label.lower():   # auto-pilih Ali Bin Abu jika ada
+    if "ali" in label.lower():       # auto-pilih Ali Bin Abu jika wujud
         default_idx = i
         break
 
-sel_stu = st.selectbox("Pilih pelajar untuk semakan & pemarkahan:", options=options, index=default_idx, format_func=lambda x: x[1], key="sel_ind_student")
+sel_stu = st.selectbox(
+    "Pilih pelajar untuk semakan & pemarkahan:",
+    options=options, index=default_idx,
+    format_func=lambda x: x[1], key="sel_ind_student"
+)
 stu_id = sel_stu[0]
 stu_label = sel_stu[1]
 
 with st.expander(f"👷 {stu_label}", expanded=True):
     tab_log, tab_bli = st.tabs(["📒 Logbook", "📝 BLI-05 (Penyelia Industri)"])
 
-    # =========================================================
-    # TAB: LOGBOOK (komen industri)
-    # =========================================================
+    # =============================== LOGBOOK =============================
     with tab_log:
         with get_conn() as conn:
             df_logs = pd.read_sql_query(
@@ -191,12 +178,16 @@ with st.expander(f"👷 {stu_label}", expanded=True):
         else:
             st.dataframe(df_logs[["entry_date","title","hours","ind_comment"]], use_container_width=True)
 
-            # Pilih satu entri untuk butiran & komen (elak expander bertingkat banyak)
+            # Pilih satu entri untuk lihat butiran & komen
             options_logs = [
                 (int(r.log_id), f"{r.entry_date} — {r.title or '-'}")
                 for r in df_logs.itertuples(index=False)
             ]
-            sel_log = st.selectbox("Pilih entri untuk lihat butiran", options=options_logs, format_func=lambda x: x[1], key=f"sel_log_{stu_id}")
+            sel_log = st.selectbox(
+                "Pilih entri untuk lihat butiran",
+                options=options_logs, format_func=lambda x: x[1],
+                key=f"sel_log_{stu_id}"
+            )
             if sel_log:
                 sel_log_id = sel_log[0]
                 rlog = df_logs[df_logs["log_id"] == sel_log_id].iloc[0]
@@ -204,12 +195,13 @@ with st.expander(f"👷 {stu_label}", expanded=True):
                 box = st.container()
                 with box:
                     st.markdown(f"**Entri:** {rlog['entry_date']} — {rlog['title'] or '-'}")
-                    st.markdown("**Aktiviti**")
-                    st.write(rlog["activities"] or "-")
-                    st.markdown("**Hasil/Outcomes**")
-                    st.write(rlog["outcomes"] or "-")
+                    st.markdown("**Aktiviti**"); st.write(rlog["activities"] or "-")
+                    st.markdown("**Hasil/Outcomes**"); st.write(rlog["outcomes"] or "-")
 
-                    new_c = st.text_area("Komen (Industri)", value=rlog["ind_comment"] or "", key=f"ind_c_{int(rlog['log_id'])}")
+                    new_c = st.text_area(
+                        "Komen (Industri)", value=rlog["ind_comment"] or "",
+                        key=f"ind_c_{int(rlog['log_id'])}"
+                    )
                     if st.button("💾 Simpan Komen (Industri)", key=f"btn_ind_{int(rlog['log_id'])}"):
                         with get_conn() as conn:
                             cur = conn.cursor()
@@ -223,25 +215,26 @@ with st.expander(f"👷 {stu_label}", expanded=True):
                         st.success("Komen industri disimpan.")
                         st.rerun()
 
-    # =========================================================
-    # TAB: BLI-05 (ikut borang UiTM, skala 1–5, 30%)
-    # =========================================================
+    # =============================== BLI-05 ==============================
     with tab_bli:
-        st.info("Penilaian mengikut borang **BLI-05** (skala 1–5 untuk setiap kriteria; markah akhir ditimbang ke 30%).")
-        # Cuba load rekod terakhir untuk prefill
-        with get_conn() as conn:
-            df_last = pd.read_sql_query(
-                """
-                SELECT items_json, js_total, weighted_30, overall_decision, comments, submitted_at
-                FROM bli05_industry
-                WHERE student_user_id=? AND term_id=? AND ind_supervisor_id=?
-                ORDER BY id DESC LIMIT 1
-                """,
-                conn, params=(stu_id, term_id, user['user_id'])
-            )
-        last_items = {}
-        last_comments = ""
-        last_decision = None
+        st.info("Penilaian mengikut borang **BLI-05** (skala 1–5 setiap kriteria; markah akhir disukat ke 30%).")
+
+        # Cuba muat nilai terakhir (prefill)
+        try:
+            with get_conn() as conn:
+                df_last = pd.read_sql_query(
+                    """
+                    SELECT items_json, js_total, weighted_30, overall_decision, comments, submitted_at
+                    FROM bli05_industry
+                    WHERE student_user_id=? AND term_id=? AND ind_supervisor_id=?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    conn, params=(stu_id, term_id, user['user_id'])
+                )
+        except Exception:
+            df_last = pd.DataFrame()
+
+        last_items, last_comments, last_decision = {}, "", None
         if not df_last.empty:
             try:
                 last_items = json.loads(df_last.iloc[0]["items_json"] or "{}")
@@ -250,9 +243,7 @@ with st.expander(f"👷 {stu_label}", expanded=True):
             last_comments = df_last.iloc[0]["comments"] or ""
             last_decision = df_last.iloc[0]["overall_decision"] or None
 
-        # Senarai kriteria (rujuk borang)
-        # Nota: Dokumen menunjukkan 9 kriteria bertanda 1–5 (dengan perincian pada item 8),
-        # jadi kita jadikan 9 item utama 1–5. JS maks = 45, markah 30% = (JS/45)*30
+        # 9 kriteria 1–5 → JS maks 45 → markah 30% = (JS/45)*30
         items = [
             (1, "Keupayaan mental (kecerdasan & keupayaan am)"),
             (2, "Keupayaan fizikal (ketahanan kerja lapangan)"),
@@ -271,30 +262,30 @@ with st.expander(f"👷 {stu_label}", expanded=True):
             default = int(last_items.get(str(no), 3))
             idx = [1,2,3,4,5].index(default) if default in [1,2,3,4,5] else 2
             scores[str(no)] = st.radio(
-                f"{no}. {label}", options=[1,2,3,4,5],
+                f"{no}. {label}",
+                options=[1,2,3,4,5],
                 horizontal=True, index=idx, key=key
             )
 
-        js_total = sum(scores.values())         # maks 45
-        weighted_30 = (js_total / 45.0) * 30.0  # disukat ke 30%
+        js_total = sum(scores.values())          # 0..45
+        weighted_30 = (js_total / 45.0) * 30.0   # 0..30
 
-        colA, colB = st.columns(2)
-        with colA:
-            st.metric("Jumlah Skor (JS)", f"{js_total} / 45")
-        with colB:
-            st.metric("Markah Ditimbang (30%)", f"{weighted_30:.2f} / 30")
+        cA, cB = st.columns(2)
+        cA.metric("Jumlah Skor (JS)", f"{js_total} / 45")
+        cB.metric("Markah Ditimbang (30%)", f"{weighted_30:.2f} / 30")
 
         decision = st.selectbox(
             "Keputusan", ["LULUS","GAGAL","TIDAK LENGKAP"],
-            index=(["LULUS","GAGAL","TIDAK LENGKAP"].index(last_decision) if last_decision in ["LULUS","GAGAL","TIDAK LENGKAP"] else 0),
+            index=(["LULUS","GAGAL","TIDAK LENGKAP"].index(last_decision)
+                   if last_decision in ["LULUS","GAGAL","TIDAK LENGKAP"] else 0),
             key=f"dec_{stu_id}"
         )
         comments = st.text_area("Komen tambahan", value=last_comments, key=f"cm_{stu_id}")
 
         details_json = json.dumps(scores, ensure_ascii=False)
 
-        colX, colY = st.columns(2)
-        if colX.button("💾 Simpan Draf (BLI-05)", key=f"draf05_{stu_id}"):
+        cX, cY = st.columns(2)
+        if cX.button("💾 Simpan Draf (BLI-05)", key=f"draf05_{stu_id}"):
             with get_conn() as conn:
                 cur = conn.cursor()
                 cur.execute("""
@@ -309,7 +300,7 @@ with st.expander(f"👷 {stu_label}", expanded=True):
             st.success("Draf BLI-05 disimpan.")
             st.rerun()
 
-        if colY.button("✅ Hantar (Muktamad BLI-05)", key=f"hantar05_{stu_id}"):
+        if cY.button("✅ Hantar (Muktamad BLI-05)", key=f"hantar05_{stu_id}"):
             with get_conn() as conn:
                 cur = conn.cursor()
                 cur.execute("""
@@ -324,9 +315,7 @@ with st.expander(f"👷 {stu_label}", expanded=True):
             st.success("Penilaian BLI-05 dihantar.")
             st.rerun()
 
-# ------------------------------------------------------------
-# Logout
-# ------------------------------------------------------------
+# ================================ LOGOUT ================================
 st.divider()
 if st.button("Log Keluar"):
     st.session_state.auth = None
