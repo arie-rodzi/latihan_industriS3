@@ -486,7 +486,13 @@ else:
     try:
         buf_perm = fill_docx(tmpl_perm, mapping_sli01)
         binary_doc = buf_perm.getvalue()
-        st.success("SLI01: Sedia dijana. " + msg) if can_dl_sli01 else st.info("SLI01: " + msg)
+
+        # SAFE: jangan guna ternary bare expression
+        if can_dl_sli01:
+            st.success("SLI01: Sedia dijana. " + msg)
+        else:
+            st.info("SLI01: " + msg)
+
         st.download_button(
             "✨ Muat Turun Surat Permohonan (Auto-isi)",
             data=binary_doc,
@@ -515,8 +521,10 @@ if not os.path.exists(tmpl_sli3):
 else:
     try:
         buf_sli3 = fill_docx(tmpl_sli3, map_sli3)
+
         if need_bli03:
             st.info("Lengkapkan **BLI-03** (Nama Organisasi) untuk auto-isi Surat Penempatan.")
+
         st.download_button(
             "✨ Muat Turun Surat Penempatan (Auto-isi)",
             data=buf_sli3.getvalue(),
