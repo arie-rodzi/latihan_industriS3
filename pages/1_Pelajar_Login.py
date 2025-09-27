@@ -61,35 +61,42 @@ try:
 except Exception as e:
     st.error(f"Ralat DB: {e}"); st.stop()
 
-# ---- Migrasi ringan: pastikan jadual/kolum muat naik wujud
-with get_conn() as conn:
-    cur = conn.cursor()
-    # BLI-02 (upload jawapan industri)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bli02_responses(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_id INTEGER NOT NULL,
-            term_id INTEGER,
-            file_name TEXT,
-            file_blob BLOB,
-            uploaded_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-    # BLI-04 (lapor diri + bukti upload)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS reporting_in(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_id INTEGER NOT NULL,
-            term_id INTEGER,
-            reported_at TEXT
-        )
-    """)
-    # Tambah kolum fail untuk reporting_in jika belum ada
-    cur.execute("PRAGMA table_info(reporting_in)")
-    cols = {r[1] for r in cur.fetchall()}
-    if "file_name" not in cols: cur.execute("ALTER TABLE reporting_in ADD COLUMN file_name TEXT")
-    if "file_blob" not in cols: cur.execute("ALTER TABLE reporting_in ADD COLUMN file_blob BLOB")
-    conn.commit()
+# ---- MIGRASI WAJIB: pastikan jadual upload wujud sebelum guna ----
+def ensure_upload_tables():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # BLI-02: jawapan industri (upload)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bli02_responses(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL,
+                term_id INTEGER,
+                file_name TEXT,
+                file_blob BLOB,
+                uploaded_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        # BLI-04: bukti lapor diri (upload)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reporting_in(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL,
+                term_id INTEGER,
+                reported_at TEXT,
+                file_name TEXT,
+                file_blob BLOB
+            )
+        """)
+        conn.commit()
+
+ensure_upload_tables()  # <<< PANGGIL AWAL
+
+# Helper: baca SQL yang kalis jadual hilang
+def safe_read_sql(conn, sql, params=(), empty_cols=None):
+    try:
+        return pd.read_sql_query(sql, conn, params=params)
+    except Exception:
+        return pd.DataFrame(columns=empty_cols or [])
 
 def require_role(roles):
     aut = st.session_state.get("auth")
@@ -228,18 +235,22 @@ with tabs[1]:
             conn.commit()
         st.success("BLI-02 berjaya dimuat naik."); st.rerun()
 
-    # Senarai & muat turun terkini
+    # Senarai & muat turun terkini (kalis jadual/kolum)
     with get_conn() as conn:
-        df_b2 = pd.read_sql_query("""
+        df_b2 = safe_read_sql(
+            conn,
+            """
             SELECT id, file_name, uploaded_at, LENGTH(file_blob) AS size
             FROM bli02_responses WHERE student_id=? AND term_id=?
             ORDER BY uploaded_at DESC
-        """, conn, params=(user['user_id'], term_id))
+            """,
+            params=(user['user_id'], term_id),
+            empty_cols=["id","file_name","uploaded_at","size"]
+        )
     if df_b2.empty:
         st.info("Belum ada muat naik BLI-02.")
     else:
         st.dataframe(df_b2[["file_name","uploaded_at","size"]], use_container_width=True, hide_index=True)
-        # butang download fail paling terkini
         with get_conn() as conn:
             cur = conn.cursor()
             cur.execute("""
@@ -292,7 +303,6 @@ with tabs[3]:
         blob = up_bli04.read()
         with get_conn() as conn:
             cur = conn.cursor()
-            # rekodkan (sekali per muat naik)
             cur.execute("""
                 INSERT INTO reporting_in(student_id, term_id, reported_at, file_name, file_blob)
                 VALUES (?,?, datetime('now'), ?, ?)
@@ -300,13 +310,17 @@ with tabs[3]:
             conn.commit()
         st.success("BLI-04 berjaya dimuat naik."); st.rerun()
 
-    # Senarai & muat turun terkini
     with get_conn() as conn:
-        df_b4 = pd.read_sql_query("""
+        df_b4 = safe_read_sql(
+            conn,
+            """
             SELECT id, file_name, reported_at AS uploaded_at, LENGTH(file_blob) AS size
             FROM reporting_in WHERE student_id=? AND term_id=?
             ORDER BY reported_at DESC
-        """, conn, params=(user['user_id'], term_id))
+            """,
+            params=(user['user_id'], term_id),
+            empty_cols=["id","file_name","uploaded_at","size"]
+        )
     if df_b4.empty:
         st.info("Belum ada muat naik BLI-04.")
     else:
