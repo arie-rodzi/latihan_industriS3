@@ -2,6 +2,8 @@
 import streamlit as st
 from lib.common import ensure_db, auth_email_or_sid, get_conn, one, term_label
 import pandas as pd
+from lib.common import require_role
+require_role(["coordinator"])  
 
 st.set_page_config(page_title="Penyelaras", page_icon="⚙️", layout="wide")
 st.title("Log Masuk Penyelaras")
