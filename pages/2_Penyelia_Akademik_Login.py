@@ -42,7 +42,7 @@ require_role(["acad_sv"])
 user = st.session_state.auth
 st.success(f"Log masuk sebagai {user['full_name']}")
 
-# ---- Pastikan jadual penting wujud (tak crash kalau baru)
+# ---- Pastikan jadual penting wujud
 with get_conn() as conn:
     cur = conn.cursor()
     cur.execute("""
@@ -122,13 +122,13 @@ st.dataframe(df_stu, use_container_width=True)
 
 st.divider()
 
-# ---------- LOOP: panel setiap pelajar (Ali, Siti, ... apa-apa yang dipadankan) ----------
+# ---------- LOOP: panel setiap pelajar ----------
 for row in df_stu.itertuples(index=False):
     stu_id = int(row.user_id)
     stu_label = f"{row.student_id} — {row.full_name} ({row.program_code or '-'})"
     with st.expander(f"👨‍🎓 {stu_label}", expanded=False):
 
-        # 1) LOGBOOK + KOMEN
+        # 1) LOGBOOK + KOMEN (tanpa expander bertingkat)
         st.markdown("### 📒 Logbook & Komen")
         with get_conn() as conn:
             df_logs = pd.read_sql_query(
@@ -139,23 +139,50 @@ for row in df_stu.itertuples(index=False):
                    ORDER BY entry_date DESC""",
                 conn, params=(stu_id, term_id)
             )
+
         st.caption(f"Jumlah entri: {len(df_logs)}")
         if df_logs.empty:
             st.info("Pelajar ini belum isi logbook.")
         else:
             st.dataframe(df_logs[["entry_date","title","hours","acad_comment"]], use_container_width=True)
-            for _, rlog in df_logs.iterrows():
-                with st.expander(f"Entri {rlog['entry_date']} — {rlog['title'] or '-'}"):
-                    st.markdown("**Aktiviti**"); st.write(rlog["activities"] or "-")
-                    st.markdown("**Hasil/Outcomes**"); st.write(rlog["outcomes"] or "-")
-                    new_c = st.text_area("Komen (Akademik)", value=rlog["acad_comment"] or "", key=f"ac_{stu_id}_{rlog['log_id']}")
-                    if st.button("Simpan Komen", key=f"btn_ac_{stu_id}_{rlog['log_id']}"):
+
+            # Pilih satu entri untuk butiran (ELAK nested expander)
+            options = [
+                (int(r.log_id), f"{r.entry_date} — {r.title or '-'}")
+                for r in df_logs.itertuples(index=False)
+            ]
+            selected = st.selectbox(
+                "Pilih entri untuk lihat butiran",
+                options=options,
+                format_func=lambda x: x[1],
+                key=f"sel_log_{stu_id}"
+            )
+            if selected:
+                sel_id = selected[0]
+                rlog = df_logs[df_logs["log_id"] == sel_id].iloc[0]
+
+                details = st.container()
+                with details:
+                    st.markdown(f"**Entri:** {rlog['entry_date']} — {rlog['title'] or '-'}")
+                    st.markdown("**Aktiviti**")
+                    st.write(rlog["activities"] or "-")
+                    st.markdown("**Hasil/Outcomes**")
+                    st.write(rlog["outcomes"] or "-")
+
+                    new_c = st.text_area(
+                        "Komen (Akademik)",
+                        value=rlog["acad_comment"] or "",
+                        key=f"ac_{stu_id}_{int(rlog['log_id'])}"
+                    )
+                    if st.button("💾 Simpan Komen", key=f"btn_ac_{stu_id}_{int(rlog['log_id'])}"):
                         with get_conn() as conn:
                             cur = conn.cursor()
-                            cur.execute("""UPDATE logbook
-                                           SET acad_comment=?, acad_commented_by=?, acad_commented_at=datetime('now')
-                                           WHERE log_id=?""",
-                                        (new_c, user['user_id'], int(rlog["log_id"])))
+                            cur.execute(
+                                """UPDATE logbook
+                                   SET acad_comment=?, acad_commented_by=?, acad_commented_at=datetime('now')
+                                   WHERE log_id=?""",
+                                (new_c, user['user_id'], int(rlog["log_id"]))
+                            )
                             conn.commit()
                         st.success("Komen disimpan."); st.rerun()
 
@@ -175,11 +202,13 @@ for row in df_stu.itertuples(index=False):
             st.dataframe(df_rep[["file_name","uploaded_at","blob_len"]], use_container_width=True)
             with get_conn() as conn:
                 cur = conn.cursor()
-                cur.execute("""SELECT file_name, file_blob
-                               FROM final_reports
-                               WHERE student_id=? AND term_id=?
-                               ORDER BY uploaded_at DESC LIMIT 1""",
-                            (stu_id, term_id))
+                cur.execute(
+                    """SELECT file_name, file_blob
+                       FROM final_reports
+                       WHERE student_id=? AND term_id=?
+                       ORDER BY uploaded_at DESC LIMIT 1""",
+                    (stu_id, term_id)
+                )
                 f = cur.fetchone()
             if f and f[1]:
                 st.download_button("⬇️ Muat Turun Laporan Akhir (terkini)", data=f[1],
