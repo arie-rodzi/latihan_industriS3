@@ -12,16 +12,18 @@ from lib.common import (
 from io import BytesIO
 from docx import Document  # pip install python-docx
 
-# Sokong 3 gaya token: «K», {{K}}, K
-TOKEN_FORMS = (lambda k: f"«{k}»", lambda k: f"{{{{{k}}}}}", lambda k: k)
+# HANYA token eksplisit: «KEY» dan {{KEY}} (TIADA raw-key!)
+TOKEN_FORMS = (lambda k: f"«{k}»", lambda k: f"{{{{{k}}}}}")
 
 def _replace_in_paragraph(p, repl: dict):
     txt = p.text or ""
-    if not txt: return
+    if not txt:
+        return
     for k, v in repl.items():
         val = "" if v is None else str(v)
         for f in TOKEN_FORMS:
             txt = txt.replace(f(k), val)
+    # rebuild runs supaya split-run Word tidak ganggu replace
     for r in list(p.runs)[::-1]:
         p._element.remove(r._element)
     p.add_run(txt)
@@ -33,7 +35,8 @@ def _replace_in_table(t, repl: dict):
                 _replace_in_paragraph(p, repl)
 
 def _replace_in_header_footer(hf, repl: dict):
-    if not hf: return
+    if not hf:
+        return
     for p in hf.paragraphs:
         _replace_in_paragraph(p, repl)
     for t in hf.tables:
@@ -42,12 +45,17 @@ def _replace_in_header_footer(hf, repl: dict):
 def fill_docx(template_path: str, mapping: dict) -> BytesIO:
     """Isi template DOCX menggunakan python-docx (body, tables, header/footer)."""
     doc = Document(template_path)
-    for p in doc.paragraphs: _replace_in_paragraph(p, mapping)
-    for t in doc.tables: _replace_in_table(t, mapping)
+    for p in doc.paragraphs:
+        _replace_in_paragraph(p, mapping)
+    for t in doc.tables:
+        _replace_in_table(t, mapping)
     for s in doc.sections:
         _replace_in_header_footer(s.header, mapping)
         _replace_in_header_footer(s.footer, mapping)
-    buf = BytesIO(); doc.save(buf); buf.seek(0); return buf
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
 
 # ================================ App Setup =================================
 st.set_page_config(page_title="Log Masuk Pelajar", page_icon="🎓", layout="wide")
@@ -59,7 +67,8 @@ SQL_PATH = os.path.join(BASE_DIR, "..", "init_mytimes_fyp.sql")
 try:
     ensure_db(SQL_PATH)
 except Exception as e:
-    st.error(f"Ralat DB: {e}"); st.stop()
+    st.error(f"Ralat DB: {e}")
+    st.stop()
 
 # ---- MIGRASI WAJIB: pastikan jadual upload wujud sebelum guna ----
 def ensure_upload_tables():
@@ -89,9 +98,9 @@ def ensure_upload_tables():
         """)
         conn.commit()
 
-ensure_upload_tables()  # <<< PANGGIL AWAL
+ensure_upload_tables()  # panggil awal
 
-# Helper: baca SQL yang kalis jadual hilang
+# Helper: baca SQL yang kalis jadual/kolum hilang
 def safe_read_sql(conn, sql, params=(), empty_cols=None):
     try:
         return pd.read_sql_query(sql, conn, params=params)
@@ -141,8 +150,10 @@ if df_term.empty:
 term_id = int(df_term.iloc[0]["term_id"])
 
 def _fmt(d):
-    try: return dt.strptime(d, "%Y-%m-%d").strftime("%d %B %Y") if d else ""
-    except Exception: return ""
+    try:
+        return dt.strptime(d, "%Y-%m-%d").strftime("%d %B %Y") if d else ""
+    except Exception:
+        return ""
 
 LI_MULA  = _fmt(df_term.iloc[0].get("start_date"))
 LI_TAMAT = _fmt(df_term.iloc[0].get("end_date"))
@@ -191,8 +202,10 @@ with tabs[0]:
         )
     data_prefill = {}
     if not df_bli01.empty and df_bli01["data_json"].iloc[0]:
-        try: data_prefill = json.loads(df_bli01["data_json"].iloc[0]) or {}
-        except Exception: data_prefill = {}
+        try:
+            data_prefill = json.loads(df_bli01["data_json"].iloc[0]) or {}
+        except Exception:
+            data_prefill = {}
 
     with st.form("form_bli01"):
         colA, colB = st.columns(2)
@@ -429,8 +442,10 @@ with get_conn() as conn:
     )
     b1 = {}
     if not df_b1.empty and df_b1["data_json"].iloc[0]:
-        try: b1 = json.loads(df_b1["data_json"].iloc[0]) or {}
-        except Exception: b1 = {}
+        try:
+            b1 = json.loads(df_b1["data_json"].iloc[0]) or {}
+        except Exception:
+            b1 = {}
     df_p = pd.read_sql_query(
         """SELECT org_name, address, contact_person, contact_email, contact_phone
            FROM placements WHERE student_id=? AND term_id=? ORDER BY id DESC LIMIT 1""",
@@ -447,30 +462,29 @@ alamat_val   = (b1.get("alamat") or "")
 guardian_val = (b1.get("guardian") or "")
 guardian_tel_val = (b1.get("guardian_tel") or "")
 
-# Mapping SLI-01: ikut token legasi + ringkas
-map_base = {
-    "NAMA": student_name,
-    "NOPELAJAR": u["student_id"] or "",
-    "PROGRAM": program_val,
-    "TARIKH": today_str,
-    "ALAMAT": alamat_val,
-    "NOIC": noic_val,
-    "NOTEL": notel_val,
-    "GUARDIAN": guardian_val,
-    "GUARDIAN_TEL": guardian_tel_val,
-    "TARIKH_MULA_LI": LI_MULA,
-    "TARIKH_TAMAT_LI": LI_TAMAT,
-}
-map_legacy = {
+# Mapping SLI-01: ikut token legasi (chevron) + {{double-curly}} jika ada
+mapping_sli01 = {
+    # token legasi (chevron)
     "NAMA_PENUH_HURUF_BESAR": student_name.upper(),
     "NOMBOR_KAD_PENGENALAN":  noic_val,
     "NOMBOR_ID_PELAJAR":      u["student_id"] or "",
     "NAMA_PROGRAM":           program_val,
-    "TARIKH_SURAT":           today_str,  # jika ada dalam template
+    "TARIKH_MULA_LI":         _fmt(df_term.iloc[0].get("start_date")),
+    "TARIKH_TAMAT_LI":        _fmt(df_term.iloc[0].get("end_date")),
+    # jika template anda juga ada versi {{...}} (kod sokong kedua-dua)
+    "NAMA":                   student_name,
+    "NOPELAJAR":              u["student_id"] or "",
+    "PROGRAM":                program_val,
+    "TARIKH":                 today_str,
+    "ALAMAT":                 alamat_val,
+    "NOIC":                   noic_val,
+    "NOTEL":                  notel_val,
+    "GUARDIAN":               guardian_val,
+    "GUARDIAN_TEL":           guardian_tel_val,
+    "TARIKH_SURAT":           today_str,
 }
-mapping_sli01 = {**map_base, **map_legacy}
 
-# Kelayakan muat turun SLI-01 (≤2 medan penting kosong)
+# Polisi muat turun SLI-01 (≤2 medan penting kosong)
 required_fields = ["nama", "no_ic", "no_tel", "alamat", "program", "guardian", "guardian_tel"]
 allowed_blanks = 2
 filled = {f: bool((b1.get(f) or "").strip()) for f in required_fields}
@@ -478,7 +492,6 @@ missing = [f for f, ok in filled.items() if not ok]
 can_dl_sli01 = len(missing) <= allowed_blanks
 msg = f"Medan diisi: {len(required_fields)-len(missing)}/{len(required_fields)}. Boleh tinggal kosong hingga {allowed_blanks}."
 
-# SLI-01 (download)
 MIME_DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 if not os.path.exists(tmpl_perm):
     st.error("Template SLI-01 tidak ditemui. Letak di `templates/SLI01_Surat_Permohonan.docx`.")
@@ -487,7 +500,6 @@ else:
         buf_perm = fill_docx(tmpl_perm, mapping_sli01)
         binary_doc = buf_perm.getvalue()
 
-        # SAFE: jangan guna ternary bare expression
         if can_dl_sli01:
             st.success("SLI01: Sedia dijana. " + msg)
         else:
@@ -507,7 +519,17 @@ else:
 
 # SLI-03 (download) — memerlukan sekurang-kurangnya Nama Organisasi
 map_sli3 = {
-    **map_base,
+    "NAMA": student_name,
+    "NOPELAJAR": u["student_id"] or "",
+    "PROGRAM": program_val,
+    "TARIKH": today_str,
+    "ALAMAT": alamat_val,
+    "NOIC": noic_val,
+    "NOTEL": notel_val,
+    "GUARDIAN": guardian_val,
+    "GUARDIAN_TEL": guardian_tel_val,
+    "TARIKH_MULA_LI": _fmt(df_term.iloc[0].get("start_date")),
+    "TARIKH_TAMAT_LI": _fmt(df_term.iloc[0].get("end_date")),
     "ORG": plc_data.get("org_name", ""),
     "ORG_ADDR": plc_data.get("address", ""),
     "ORG_PIC": plc_data.get("contact_person", ""),
