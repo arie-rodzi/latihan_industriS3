@@ -1,5 +1,5 @@
 # pages/4_Penyelaras_Dashboard.py
-import os, io, json, re
+import os, io, json, re, math
 import pandas as pd
 import streamlit as st
 from lib.common import ensure_db, auth_email_or_sid, get_conn, one, term_label
@@ -53,6 +53,61 @@ def ensure_users_has_class_section():
             conn.commit()
 ensure_users_has_class_section()
 
+# ====== SEED DEMO: jika program ini tiada langsung kelas, auto pecahkan kepada 2 kelas (…7A, …7B) ======
+def seed_demo_sections_for_program(program_code: str):
+    """Auto-assign class_section untuk pelajar program ini jika kosong.
+       Logik: sort ikut student_id → bahagikan hampir sama rata ke {program}7A dan {program}7B."""
+    with get_conn() as conn:
+        # Ada data kelas?
+        df_chk = pd.read_sql_query("""
+            SELECT COUNT(1) AS c
+            FROM users
+            WHERE role_id=1 AND program_code=? AND COALESCE(class_section,'')!=''
+        """, conn, params=(program_code,))
+        has_any = int(df_chk.iloc[0]["c"]) > 0
+
+        if has_any:
+            return 0, (f"{program_code} — kelas sedia ada, tiada seeding")
+
+        # ambil semua pelajar program ini
+        df_students = pd.read_sql_query("""
+            SELECT user_id, student_id
+            FROM users
+            WHERE role_id=1 AND program_code=?
+            ORDER BY CAST(student_id AS TEXT)
+        """, conn, params=(program_code,))
+
+        if df_students.empty:
+            return 0, (f"{program_code} — tiada pelajar untuk diseed")
+
+        # tentukan label kelas
+        # contoh ringkas: kalau program CS241 → kelas CS2417A & CS2417B
+        suffix = "7"
+        secA = f"{program_code}{suffix}A"
+        secB = f"{program_code}{suffix}B"
+
+        # bahagikan hampir separuh
+        n = len(df_students)
+        half = math.ceil(n/2)
+        idsA = df_students.iloc[:half]["user_id"].tolist()
+        idsB = df_students.iloc[half:]["user_id"].tolist()
+
+        cur = conn.cursor()
+        if idsA:
+            cur.execute(f"UPDATE users SET class_section=? WHERE user_id IN ({','.join(['?']*len(idsA))})",
+                        (secA, *idsA))
+        if idsB:
+            cur.execute(f"UPDATE users SET class_section=? WHERE user_id IN ({','.join(['?']*len(idsB))})",
+                        (secB, *idsB))
+        conn.commit()
+        return n, (f"Seed kelas demo siap: {secA} ~{len(idsA)} pelajar, {secB} ~{len(idsB)} pelajar")
+
+# jalankan seeding DEMO bila perlu
+seed_n, seed_msg = seed_demo_sections_for_program(program_managed)
+if seed_n > 0:
+    st.warning(seed_msg)
+# kalau tak perlu seeding, diam2 je; data real kekal
+
 # Util CSV (tanpa xlsxwriter)
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     buf = io.StringIO(); df.to_csv(buf, index=False); return buf.getvalue().encode("utf-8")
@@ -77,7 +132,7 @@ def require_cols(df: pd.DataFrame, cols: list[str]) -> tuple[bool, str]:
 
 st.divider()
 
-# ====================== Senarai kelas sedia ada (daripada DB pendaftaran) ======================
+# ====================== Senarai kelas sedia ada (selepas seeding jika perlu) ======================
 with get_conn() as conn:
     df_sections = pd.read_sql_query("""
         SELECT class_section, COUNT(1) AS bil
@@ -87,7 +142,7 @@ with get_conn() as conn:
         ORDER BY class_section
     """, conn, params=(program_managed,))
 if df_sections.empty:
-    st.error("Tiada kelas ditemui untuk program ini. Pastikan pelajar program ini mempunyai `class_section` semasa pendaftaran.")
+    st.error("Masih tiada kelas ditemui untuk program ini (walau selepas seeding). Sahkan data pelajar wujud.")
     st.stop()
 
 kelas_list = df_sections["class_section"].tolist()
@@ -98,7 +153,7 @@ cls_params = (kelas,)
 
 # ====================== Upload pensyarah akademik & matching kelas ======================
 st.header("🧑‍🏫 Muat Naik Pensyarah Akademik & Padan (Kelas terpilih)")
-st.caption("**Templat CSV/XLSX**: lajur **sv_email,full_name,max_students** (max_students opsyenal). Program akan diambil sebagai **"
+st.caption("**Templat CSV/XLSX**: lajur **sv_email,full_name,max_students** (max_students opsyenal). Program diambil sebagai **"
            + program_managed + "** mengikut akaun penyelaras.")
 
 tmpl_sv = pd.DataFrame({"sv_email":[],"full_name":[],"max_students":[]})
@@ -208,7 +263,7 @@ if st.button("⚖️ Jana & Simpan Padanan Akademik (untuk kelas ini)"):
 
 st.divider()
 
-# ====================== Roster kelas (data sedia ada) ======================
+# ====================== Roster kelas (data sedia ada / selepas seeding) ======================
 st.header("👥 Senarai Pelajar (mengikut kelas)")
 
 with get_conn() as conn:
@@ -236,7 +291,7 @@ with get_conn() as conn:
     df_roster = pd.read_sql_query(sql_roster, conn, params=params)
 
 if df_roster.empty:
-    st.error("Tiada pelajar ditemui untuk kelas ini. Sahkan data pendaftaran (class_section) memang wujud.")
+    st.error("Tiada pelajar ditemui untuk kelas ini. (Pelik, patutnya selepas seeding mesti ada.)")
 else:
     st.caption(f"Bilangan pelajar: **{len(df_roster)}**")
     st.dataframe(df_roster[["no_pelajar","nama_pelajar","program","kelas","organisasi","penyelia_industri","penyelia_akademik"]],
@@ -331,7 +386,7 @@ dfm = df_students.merge(df_acad, on="user_id", how="left").merge(df_ind, on="use
 for col in ["score_komunikasi","score_disiplin","score_kualiti","score_kehadiran","score_inisiatif","total","ind_total"]:
     if col in dfm.columns: dfm[col] = pd.to_numeric(dfm[col], errors="coerce")
 
-# Pemetaan CLO Akademik (boleh ubah jika perlu)
+# Pemetaan CLO Akademik
 dfm["CLO1_Akad"] = dfm["score_komunikasi"]
 dfm["CLO2_Akad"] = dfm["score_disiplin"] + dfm["score_kehadiran"]
 dfm["CLO3_Akad"] = dfm["score_kualiti"]
