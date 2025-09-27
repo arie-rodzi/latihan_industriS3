@@ -1,5 +1,5 @@
 # pages/1_Pelajar_Login.py
-import os, io, json, datetime
+import os, io, json, datetime, traceback
 from datetime import date, datetime as dt
 import pandas as pd
 import streamlit as st
@@ -8,22 +8,16 @@ from lib.common import (
     ensure_db, auth_email_or_sid, get_conn, one, term_label
 )
 
-# --------------------------- DOCX Filler (python-docx) ---------------------------
+# =========================== DOCX Filler (python-docx) ===========================
 from io import BytesIO
 from docx import Document  # pip install python-docx
 
-# Sokong 3 gaya token: «KUNCI», {{KUNCI}}, KUNCI
-TOKEN_FORMS = (
-    lambda k: f"«{k}»",
-    lambda k: f"{{{{{k}}}}}",
-    lambda k: k,
-)
+# Sokong 3 gaya token: «K», {{K}}, K
+TOKEN_FORMS = (lambda k: f"«{k}»", lambda k: f"{{{{{k}}}}}", lambda k: k)
 
 def _replace_in_paragraph(p, repl: dict):
-    # Ganti token pada text penuh; rebuild runs untuk stabil
     txt = p.text or ""
-    if not txt:
-        return
+    if not txt: return
     for k, v in repl.items():
         val = "" if v is None else str(v)
         for f in TOKEN_FORMS:
@@ -48,22 +42,14 @@ def _replace_in_header_footer(hf, repl: dict):
 def fill_docx(template_path: str, mapping: dict) -> BytesIO:
     """Isi template DOCX menggunakan python-docx (body, tables, header/footer)."""
     doc = Document(template_path)
-    # Body
-    for p in doc.paragraphs:
-        _replace_in_paragraph(p, mapping)
-    for t in doc.tables:
-        _replace_in_table(t, mapping)
-    # Header/Footer semua section
+    for p in doc.paragraphs: _replace_in_paragraph(p, mapping)
+    for t in doc.tables: _replace_in_table(t, mapping)
     for s in doc.sections:
         _replace_in_header_footer(s.header, mapping)
         _replace_in_header_footer(s.footer, mapping)
-    # Output
-    buf = BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf
+    buf = BytesIO(); doc.save(buf); buf.seek(0); return buf
 
-# --------------------------- App Setup ---------------------------
+# ================================ App Setup =================================
 st.set_page_config(page_title="Log Masuk Pelajar", page_icon="🎓", layout="wide")
 st.title("Log Masuk Pelajar")
 
@@ -73,8 +59,37 @@ SQL_PATH = os.path.join(BASE_DIR, "..", "init_mytimes_fyp.sql")
 try:
     ensure_db(SQL_PATH)
 except Exception as e:
-    st.error(f"Ralat DB: {e}")
-    st.stop()
+    st.error(f"Ralat DB: {e}"); st.stop()
+
+# ---- Migrasi ringan: pastikan jadual/kolum muat naik wujud
+with get_conn() as conn:
+    cur = conn.cursor()
+    # BLI-02 (upload jawapan industri)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bli02_responses(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            term_id INTEGER,
+            file_name TEXT,
+            file_blob BLOB,
+            uploaded_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    # BLI-04 (lapor diri + bukti upload)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reporting_in(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            term_id INTEGER,
+            reported_at TEXT
+        )
+    """)
+    # Tambah kolum fail untuk reporting_in jika belum ada
+    cur.execute("PRAGMA table_info(reporting_in)")
+    cols = {r[1] for r in cur.fetchall()}
+    if "file_name" not in cols: cur.execute("ALTER TABLE reporting_in ADD COLUMN file_name TEXT")
+    if "file_blob" not in cols: cur.execute("ALTER TABLE reporting_in ADD COLUMN file_blob BLOB")
+    conn.commit()
 
 def require_role(roles):
     aut = st.session_state.get("auth")
@@ -84,7 +99,7 @@ def require_role(roles):
             st.session_state.auth = None; st.rerun()
         st.stop()
 
-# --------------------------- Login ---------------------------
+# ================================ Login =====================================
 if "auth" not in st.session_state:
     st.session_state.auth = None
 
@@ -103,7 +118,7 @@ if not st.session_state.auth:
             st.session_state.auth = user; st.rerun()
     st.stop()
 
-# --------------------------- Selepas Login ---------------------------
+# ============================ Selepas Login =================================
 user = st.session_state.auth
 require_role(["student"])
 st.success(f"Log masuk sebagai {user['full_name']} ({user.get('program_code') or '-'})")
@@ -114,20 +129,18 @@ with get_conn() as conn:
     df_term = pd.read_sql_query(
         "SELECT term_id, start_date, end_date FROM terms ORDER BY term_id DESC LIMIT 1", conn
     )
-term_id = int(df_term.iloc[0]["term_id"]) if not df_term.empty else None
-if not term_id:
+if df_term.empty:
     st.warning("Tiada term aktif."); st.stop()
+term_id = int(df_term.iloc[0]["term_id"])
 
 def _fmt(d):
-    try:
-        return dt.strptime(d, "%Y-%m-%d").strftime("%d %B %Y") if d else ""
-    except Exception:
-        return ""
+    try: return dt.strptime(d, "%Y-%m-%d").strftime("%d %B %Y") if d else ""
+    except Exception: return ""
 
 LI_MULA  = _fmt(df_term.iloc[0].get("start_date"))
 LI_TAMAT = _fmt(df_term.iloc[0].get("end_date"))
 
-# --------------------------- Metrics ---------------------------
+# ================================ Metrics ===================================
 with get_conn() as conn:
     bli01 = one(conn, "SELECT COUNT(1) FROM bli01 WHERE student_id=? AND term_id=?", (user['user_id'], term_id)) or 0
     bli02 = one(conn, "SELECT COUNT(1) FROM bli02_responses WHERE student_id=? AND term_id=?", (user['user_id'], term_id)) or 0
@@ -144,7 +157,7 @@ c2.metric("BLI-01", "✅" if bli01 else "❌")
 c3.metric("BLI-02 (upload)", "✅" if bli02 else "❌")
 c4, c5, c6 = st.columns(3)
 c4.metric("BLI-03", "✅" if plc else "❌")
-c5.metric("BLI-04", "✅" if repin else "❌")
+c5.metric("BLI-04 (upload)", "✅" if repin else "❌")
 c6.metric("Logbook Mingguan", f"{logs} entri")
 c7, c8, c9 = st.columns(3)
 c7.metric("Laporan Akhir", "✅" if rep else "❌")
@@ -153,11 +166,16 @@ c9.metric("BLI-08 (Akademik)", "✅" if aca else "❌")
 
 st.divider()
 
-# --------------------------- Borang Atas Talian ---------------------------
-st.markdown("## 📝 Borang Atas Talian")
-tabs = st.tabs(["BLI-01 Maklumat Peribadi", "BLI-03 Pengesahan Penempatan", "BLI-04 Lapor Diri"])
+# ============================ Borang & Upload ================================
+st.markdown("## 📝 Borang Atas Talian & Muat Naik")
+tabs = st.tabs([
+    "BLI-01 Maklumat Peribadi",
+    "BLI-02 (Jawapan Industri - Muat Naik)",
+    "BLI-03 Pengesahan Penempatan",
+    "BLI-04 (Lapor Diri - Muat Naik)"
+])
 
-# --- BLI-01
+# --- BLI-01 (online form)
 with tabs[0]:
     with get_conn() as conn:
         df_bli01 = pd.read_sql_query(
@@ -166,10 +184,8 @@ with tabs[0]:
         )
     data_prefill = {}
     if not df_bli01.empty and df_bli01["data_json"].iloc[0]:
-        try:
-            data_prefill = json.loads(df_bli01["data_json"].iloc[0]) or {}
-        except Exception:
-            data_prefill = {}
+        try: data_prefill = json.loads(df_bli01["data_json"].iloc[0]) or {}
+        except Exception: data_prefill = {}
 
     with st.form("form_bli01"):
         colA, colB = st.columns(2)
@@ -197,14 +213,51 @@ with tabs[0]:
             conn.commit()
         st.success("BLI-01 disimpan."); st.rerun()
 
-# --- BLI-03
+# --- BLI-02 (upload jawapan industri)
 with tabs[1]:
+    st.caption("Muat naik jawapan/pengesahan industri (PDF/DOC/DOCX/imej).")
+    uploaded = st.file_uploader("Pilih fail", type=["pdf","doc","docx","jpg","jpeg","png"], key="bli02_up")
+    if uploaded and st.button("Upload BLI-02"):
+        data = uploaded.read()
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO bli02_responses(student_id, term_id, file_name, file_blob, uploaded_at)
+                VALUES (?,?,?,?, datetime('now'))
+            """, (user['user_id'], term_id, uploaded.name, data))
+            conn.commit()
+        st.success("BLI-02 berjaya dimuat naik."); st.rerun()
+
+    # Senarai & muat turun terkini
+    with get_conn() as conn:
+        df_b2 = pd.read_sql_query("""
+            SELECT id, file_name, uploaded_at, LENGTH(file_blob) AS size
+            FROM bli02_responses WHERE student_id=? AND term_id=?
+            ORDER BY uploaded_at DESC
+        """, conn, params=(user['user_id'], term_id))
+    if df_b2.empty:
+        st.info("Belum ada muat naik BLI-02.")
+    else:
+        st.dataframe(df_b2[["file_name","uploaded_at","size"]], use_container_width=True, hide_index=True)
+        # butang download fail paling terkini
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT file_name, file_blob FROM bli02_responses
+                WHERE student_id=? AND term_id=? ORDER BY uploaded_at DESC LIMIT 1
+            """, (user['user_id'], term_id))
+            row = cur.fetchone()
+        if row and row[1]:
+            st.download_button("⬇️ Muat Turun BLI-02 (terkini)", data=row[1],
+                               file_name=row[0], type="secondary")
+
+# --- BLI-03 (online form)
+with tabs[2]:
     with get_conn() as conn:
         df_plc = pd.read_sql_query("""
             SELECT org_name, address, contact_person, contact_email, contact_phone
             FROM placements
-            WHERE student_id=? AND term_id=?
-            ORDER BY id DESC LIMIT 1
+            WHERE student_id=? AND term_id=? ORDER BY id DESC LIMIT 1
         """, conn, params=(user["user_id"], term_id))
     plc_prefill = df_plc.iloc[0].to_dict() if not df_plc.empty else {}
 
@@ -231,29 +284,47 @@ with tabs[1]:
                 conn.commit()
             st.success("BLI-03 disimpan."); st.rerun()
 
-# --- BLI-04
-with tabs[2]:
+# --- BLI-04 (upload bukti lapor diri)
+with tabs[3]:
+    st.caption("Muat naik bukti Lapor Diri (PDF/DOC/DOCX/imej).")
+    up_bli04 = st.file_uploader("Pilih fail", type=["pdf","doc","docx","jpg","jpeg","png"], key="bli04_up")
+    if up_bli04 and st.button("Upload BLI-04"):
+        blob = up_bli04.read()
+        with get_conn() as conn:
+            cur = conn.cursor()
+            # rekodkan (sekali per muat naik)
+            cur.execute("""
+                INSERT INTO reporting_in(student_id, term_id, reported_at, file_name, file_blob)
+                VALUES (?,?, datetime('now'), ?, ?)
+            """, (user['user_id'], term_id, up_bli04.name, blob))
+            conn.commit()
+        st.success("BLI-04 berjaya dimuat naik."); st.rerun()
+
+    # Senarai & muat turun terkini
     with get_conn() as conn:
-        done = pd.read_sql_query(
-            "SELECT COUNT(1) AS c FROM reporting_in WHERE student_id=? AND term_id=?",
-            conn, params=(user["user_id"], term_id)
-        )["c"].iloc[0] > 0
-    if done:
-        st.success("Sudah lapor diri. Terima kasih!")
+        df_b4 = pd.read_sql_query("""
+            SELECT id, file_name, reported_at AS uploaded_at, LENGTH(file_blob) AS size
+            FROM reporting_in WHERE student_id=? AND term_id=?
+            ORDER BY reported_at DESC
+        """, conn, params=(user['user_id'], term_id))
+    if df_b4.empty:
+        st.info("Belum ada muat naik BLI-04.")
     else:
-        if st.button("Saya sahkan sudah Lapor Diri (BLI-04)"):
-            with get_conn() as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO reporting_in(student_id, term_id, reported_at)
-                    VALUES (?,?, datetime('now'))
-                """, (user["user_id"], term_id))
-                conn.commit()
-            st.success("BLI-04 direkodkan."); st.rerun()
+        st.dataframe(df_b4[["file_name","uploaded_at","size"]], use_container_width=True, hide_index=True)
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT file_name, file_blob FROM reporting_in
+                WHERE student_id=? AND term_id=? ORDER BY reported_at DESC LIMIT 1
+            """, (user['user_id'], term_id))
+            row = cur.fetchone()
+        if row and row[1]:
+            st.download_button("⬇️ Muat Turun BLI-04 (terkini)", data=row[1],
+                               file_name=row[0], type="secondary")
 
 st.divider()
 
-# --------------------------- Logbook Mingguan ---------------------------
+# ============================ Logbook Mingguan ===============================
 st.markdown("## 📒 Logbook Mingguan")
 
 with get_conn() as conn:
@@ -327,13 +398,12 @@ else:
 
 st.divider()
 
-# --------------------------- Surat Auto-isi ---------------------------
+# =================== Surat Auto-isi (SLI-01 & SLI-03) =======================
 st.markdown("## 📄 Surat Permohonan & Penempatan (Auto-isi)")
-
 tmpl_perm = os.path.join(BASE_DIR, "..", "templates", "SLI01_Surat_Permohonan.docx")
-tmpl_sli3  = os.path.join(BASE_DIR, "..", "templates", "SLI03_Surat_Penempatan.docx")
+tmpl_sli3 = os.path.join(BASE_DIR, "..", "templates", "SLI03_Surat_Penempatan.docx")
 
-# Data profil + BLI-01 + BLI-03
+# Kumpul data profil + BLI-01 + BLI-03
 with get_conn() as conn:
     u = pd.read_sql_query(
         "SELECT full_name, student_id, program_code FROM users WHERE user_id=?",
@@ -355,7 +425,6 @@ with get_conn() as conn:
     plc_data = df_p.iloc[0].to_dict() if not df_p.empty else {}
 
 today_str = datetime.date.today().strftime("%d %B %Y")
-
 student_name = (b1.get("nama") or u["full_name"])
 program_val  = (b1.get("program") or u["program_code"] or "")
 noic_val     = (b1.get("no_ic") or "")
@@ -364,7 +433,7 @@ alamat_val   = (b1.get("alamat") or "")
 guardian_val = (b1.get("guardian") or "")
 guardian_tel_val = (b1.get("guardian_tel") or "")
 
-# --- Mapping SLI-01: ikut token template anda (legasi) + token ringkas ---
+# Mapping SLI-01: ikut token legasi + ringkas
 map_base = {
     "NAMA": student_name,
     "NOPELAJAR": u["student_id"] or "",
@@ -383,11 +452,11 @@ map_legacy = {
     "NOMBOR_KAD_PENGENALAN":  noic_val,
     "NOMBOR_ID_PELAJAR":      u["student_id"] or "",
     "NAMA_PROGRAM":           program_val,
-    "TARIKH_SURAT":           today_str,  # jika template ada token ini
+    "TARIKH_SURAT":           today_str,  # jika ada dalam template
 }
 mapping_sli01 = {**map_base, **map_legacy}
 
-# Polisi muat turun SLI-01: ≤2 medan kosong
+# Kelayakan muat turun SLI-01 (≤2 medan penting kosong)
 required_fields = ["nama", "no_ic", "no_tel", "alamat", "program", "guardian", "guardian_tel"]
 allowed_blanks = 2
 filled = {f: bool((b1.get(f) or "").strip()) for f in required_fields}
@@ -395,24 +464,28 @@ missing = [f for f, ok in filled.items() if not ok]
 can_dl_sli01 = len(missing) <= allowed_blanks
 msg = f"Medan diisi: {len(required_fields)-len(missing)}/{len(required_fields)}. Boleh tinggal kosong hingga {allowed_blanks}."
 
-# SLI-01
+# SLI-01 (download)
+MIME_DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 if not os.path.exists(tmpl_perm):
     st.error("Template SLI-01 tidak ditemui. Letak di `templates/SLI01_Surat_Permohonan.docx`.")
 else:
     try:
         buf_perm = fill_docx(tmpl_perm, mapping_sli01)
+        binary_doc = buf_perm.getvalue()
         st.success("SLI01: Sedia dijana. " + msg) if can_dl_sli01 else st.info("SLI01: " + msg)
         st.download_button(
             "✨ Muat Turun Surat Permohonan (Auto-isi)",
-            data=buf_perm.getvalue(),
+            data=binary_doc,
             file_name=f"SLI01_{u['student_id']}.docx",
+            mime=MIME_DOCX,
             type="secondary",
             disabled=not can_dl_sli01
         )
-    except Exception as e:
-        st.error(f"Gagal jana SLI-01: {e}")
+    except Exception:
+        st.error("Gagal jana SLI-01.")
+        st.code(traceback.format_exc())
 
-# --- Mapping & SLI-03 ---
+# SLI-03 (download) — memerlukan sekurang-kurangnya Nama Organisasi
 map_sli3 = {
     **map_base,
     "ORG": plc_data.get("org_name", ""),
@@ -434,13 +507,15 @@ else:
             "✨ Muat Turun Surat Penempatan (Auto-isi)",
             data=buf_sli3.getvalue(),
             file_name=f"SLI03_{u['student_id']}.docx",
+            mime=MIME_DOCX,
             type="secondary",
             disabled=need_bli03
         )
-    except Exception as e:
-        st.error(f"Gagal jana SLI-03: {e}")
+    except Exception:
+        st.error("Gagal jana SLI-03.")
+        st.code(traceback.format_exc())
 
-# --------------------------- Logout ---------------------------
+# ================================ Logout ====================================
 st.divider()
 if st.button("Log Keluar"):
     st.session_state.auth = None; st.rerun()
