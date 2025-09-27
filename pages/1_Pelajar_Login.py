@@ -21,8 +21,7 @@ SQL_PATH = os.path.join(BASE_DIR, "..", "init_mytimes_fyp.sql")
 try:
     ensure_db(SQL_PATH)  # pastikan DB + skema wujud
 except Exception as e:
-    st.error(f"Ralat DB: {e}")
-    st.stop()
+    st.error(f"Ralat DB: {e}"); st.stop()
 
 # -------------------- Guard util --------------------
 def require_role(roles):
@@ -30,8 +29,7 @@ def require_role(roles):
     if not aut or aut.get("role_name") not in roles:
         st.error("Akses tidak dibenarkan di halaman Pelajar. Sila log masuk sebagai Pelajar.")
         if st.button("Log Keluar"):
-            st.session_state.auth = None
-            st.rerun()
+            st.session_state.auth = None; st.rerun()
         st.stop()
 
 # -------------------- Login --------------------
@@ -46,28 +44,25 @@ if not st.session_state.auth:
     if submitted:
         user = auth_email_or_sid(login_text, password)
         if not user:
-            st.error("Maklumat log masuk tidak sah.")
+            st.info("Maklumat log masuk tidak sah.")
         elif user.get("role_name") != "student":
-            st.error("Akaun ini bukan peranan Pelajar.")
+            st.info("Akaun ini bukan peranan Pelajar.")
         else:
-            st.session_state.auth = user
-            st.rerun()
+            st.session_state.auth = user; st.rerun()
     st.stop()
 
 # -------------------- Selepas login --------------------
 user = st.session_state.auth
-require_role(["student"])  # kunci peranan
+require_role(["student"])
 st.success(f"Log masuk sebagai {user['full_name']} ({user.get('program_code') or '-'})")
 
 # -------------------- Term semasa (awal, sebelum metrik) --------------------
 with get_conn() as conn:
     tlabel = term_label(conn)
     df_term = pd.read_sql_query("SELECT term_id, start_date FROM terms ORDER BY term_id DESC LIMIT 1", conn)
-
 term_id = int(df_term.iloc[0]["term_id"]) if not df_term.empty else None
 if not term_id:
-    st.warning("Tiada term aktif.")
-    st.stop()
+    st.warning("Tiada term aktif."); st.stop()
 
 # -------------------- Metrics ringkas --------------------
 with get_conn() as conn:
@@ -80,18 +75,18 @@ with get_conn() as conn:
     ind   = one(conn, "SELECT COUNT(1) FROM bli05_industry WHERE student_user_id=? AND term_id=?", (user['user_id'], term_id)) or 0
     aca   = one(conn, "SELECT COUNT(1) FROM bli08_academic WHERE student_user_id=? AND term_id=?", (user['user_id'], term_id)) or 0
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Sesi", tlabel)
-col2.metric("BLI-01", "✅" if bli01 else "❌")
-col3.metric("BLI-02 (upload)", "✅" if bli02 else "❌")
-col4, col5, col6 = st.columns(3)
-col4.metric("BLI-03", "✅" if plc else "❌")
-col5.metric("BLI-04", "✅" if repin else "❌")
-col6.metric("Logbook Mingguan", f"{logs} entri")
-col7, col8, col9 = st.columns(3)
-col7.metric("Laporan Akhir", "✅" if rep else "❌")
-col8.metric("BLI-05 (Industri)", "✅" if ind else "❌")
-col9.metric("BLI-08 (Akademik)", "✅" if aca else "❌")
+c1, c2, c3 = st.columns(3)
+c1.metric("Sesi", tlabel)
+c2.metric("BLI-01", "✅" if bli01 else "❌")
+c3.metric("BLI-02 (upload)", "✅" if bli02 else "❌")
+c4, c5, c6 = st.columns(3)
+c4.metric("BLI-03", "✅" if plc else "❌")
+c5.metric("BLI-04", "✅" if repin else "❌")
+c6.metric("Logbook Mingguan", f"{logs} entri")
+c7, c8, c9 = st.columns(3)
+c7.metric("Laporan Akhir", "✅" if rep else "❌")
+c8.metric("BLI-05 (Industri)", "✅" if ind else "❌")
+c9.metric("BLI-08 (Akademik)", "✅" if aca else "❌")
 
 st.divider()
 
@@ -138,8 +133,7 @@ with tabs[0]:
                 VALUES (?,?,datetime('now'),?)
             """, (user["user_id"], term_id, json.dumps(payload)))
             conn.commit()
-        st.success("BLI-01 disimpan.")
-        st.rerun()
+        st.success("BLI-01 disimpan."); st.rerun()
 
 # --- BLI-03 (Pengesahan Penempatan)
 with tabs[1]:
@@ -163,7 +157,7 @@ with tabs[1]:
 
     if hantar_bli03:
         if not org_name.strip():
-            st.error("Nama organisasi wajib diisi.")
+            st.info("Nama organisasi wajib diisi.")
         else:
             with get_conn() as conn:
                 cur = conn.cursor()
@@ -174,8 +168,7 @@ with tabs[1]:
                 """, (user["user_id"], org_name.strip(), org_addr.strip(), contact_person.strip(),
                       contact_email.strip(), contact_phone.strip(), term_id))
                 conn.commit()
-            st.success("BLI-03 disimpan.")
-            st.rerun()
+            st.success("BLI-03 disimpan."); st.rerun()
 
 # --- BLI-04 (Lapor Diri)
 with tabs[2]:
@@ -196,15 +189,14 @@ with tabs[2]:
                     VALUES (?,?, datetime('now'))
                 """, (user["user_id"], term_id))
                 conn.commit()
-            st.success("BLI-04 direkodkan.")
-            st.rerun()
+            st.success("BLI-04 direkodkan."); st.rerun()
 
 st.divider()
 
 # -------------------- Logbook Mingguan --------------------
 st.markdown("## 📒 Logbook Mingguan")
 
-# Guna start_date jika diperlukan (opsyenal)
+# (Opsyenal) tarik tarikh mula term
 term_start = None
 try:
     if not df_term.empty and df_term.iloc[0]["start_date"]:
@@ -233,7 +225,7 @@ with st.form("form_logbook"):
 
 if submit_log:
     if not title.strip() or not activities.strip():
-        st.error("Sila isi sekurang-kurangnya **Tajuk** dan **Aktiviti**.")
+        st.info("Sila isi sekurang-kurangnya **Tajuk** dan **Aktiviti**.")
     else:
         with get_conn() as conn:
             cur = conn.cursor()
@@ -248,7 +240,7 @@ if submit_log:
                 return bool(r and ((r[1] and r[1].strip()) or (r[2] and r[2].strip())))
 
             if row and commented(row):
-                st.error("Entri pada tarikh ini telah menerima komen penyelia dan tidak boleh diubah.")
+                st.info("Entri pada tarikh ini telah menerima komen penyelia dan tidak boleh diubah.")
             elif row:
                 cur.execute("""
                     UPDATE logbook
@@ -256,8 +248,7 @@ if submit_log:
                     WHERE log_id=?
                 """, (title.strip(), activities.strip(), outcomes.strip(), float(hours), int(row[0])))
                 conn.commit()
-                st.success("Logbook dikemas kini.")
-                st.rerun()
+                st.success("Logbook dikemas kini."); st.rerun()
             else:
                 cur.execute("""
                     INSERT INTO logbook(student_id, term_id, entry_date, title, activities, outcomes, hours, created_at)
@@ -265,8 +256,7 @@ if submit_log:
                 """, (user["user_id"], term_id, entry_date.isoformat(),
                       title.strip(), activities.strip(), outcomes.strip(), float(hours)))
                 conn.commit()
-                st.success("Logbook disimpan.")
-                st.rerun()
+                st.success("Logbook disimpan."); st.rerun()
 
 st.markdown("### Entri Terkini")
 if df_logs.empty:
@@ -315,21 +305,24 @@ with get_conn() as conn:
     plc_data = df_p.iloc[0].to_dict() if not df_p.empty else {}
 
 today_str = datetime.date.today().strftime("%d %b %Y")
+
+# --- Pemetaan SLI01 (guna nilai yang telah diisi; jika kosong, biar kosong) ---
+student_name = (b1.get("nama") or u["full_name"])  # guna nama diisi jika ada
 mapping_base = {
-    "NAMA": u["full_name"],
+    "NAMA": student_name,
     "NOPELAJAR": u["student_id"] or "",
-    "PROGRAM": u["program_code"] or "",
+    "PROGRAM": (b1.get("program") or u["program_code"] or ""),
     "TARIKH": today_str,
-    # BLI-01
     "ALAMAT": b1.get("alamat", ""),
     "NOIC": b1.get("no_ic", ""),
     "NOTEL": b1.get("no_tel", ""),
     "GUARDIAN": b1.get("guardian", ""),
     "GUARDIAN_TEL": b1.get("guardian_tel", ""),
 }
+
+# --- Pemetaan SLI03 (bergantung pada BLI-03) ---
 mapping_sli3 = {
     **mapping_base,
-    # BLI-03
     "ORG": plc_data.get("org_name", ""),
     "ORG_ADDR": plc_data.get("address", ""),
     "ORG_PIC": plc_data.get("contact_person", ""),
@@ -337,38 +330,66 @@ mapping_sli3 = {
     "ORG_PHONE": plc_data.get("contact_phone", ""),
 }
 
-need_bli01 = not mapping_base["ALAMAT"]  # anggap alamat wajib utk SLI01
-need_bli03 = not mapping_sli3["ORG"]     # organisasi wajib utk SLI-03
+# =============== Polisi kelayakan muat turun SLI01 ===============
+required_fields = ["nama", "no_ic", "no_tel", "alamat", "program", "guardian", "guardian_tel"]
+allowed_blanks = 2
 
-c1, c2 = st.columns(2)
-with c1:
+filled = {f: (bool((b1.get(f) or "").strip())) for f in required_fields}
+missing_fields = [f for f, ok in filled.items() if not ok]
+can_download_sli01 = (len(missing_fields) <= allowed_blanks)
+
+# Status lembut (tiada merah)
+sli01_status = f"Medan diisi: {len(required_fields) - len(missing_fields)}/{len(required_fields)}. " \
+               f"Boleh tinggal kosong hingga {allowed_blanks} medan."
+if can_download_sli01:
+    st.success(f"SLI01: Sedia dijana. {sli01_status}")
+else:
+    st.info(f"SLI01: Lengkapkan maklumat BLI-01 dahulu. {sli01_status}")
+    if missing_fields:
+        labels = {
+            "nama":"Nama Penuh", "no_ic":"No. IC", "no_tel":"No. Telefon", "alamat":"Alamat",
+            "program":"Kod Program", "guardian":"Nama Penjaga/Waris", "guardian_tel":"Telefon Penjaga/Waris"
+        }
+        senarai = ", ".join(labels.get(m, m) for m in missing_fields)
+        st.caption(f"Masih kosong: {senarai}")
+
+cA, cB = st.columns(2)
+with cA:
     if not os.path.exists(tmpl_perm):
         st.error("Template SLI01 tidak ditemui. Letak di `templates/SLI01_Surat_Permohonan.docx`.")
-    elif need_bli01:
-        st.warning("Lengkapkan BLI-01 dahulu (alamat/IC/telefon) untuk auto-isi Surat Permohonan.")
     else:
         try:
-            b = render_docx_from_template(tmpl_perm, mapping_base)
-            st.download_button("✨ Muat Turun Surat Permohonan (Auto-isi)", b,
-                               file_name=f"SLI01_{u['student_id']}.docx", type="primary")
+            buf = render_docx_from_template(tmpl_perm, mapping_base)
+            st.download_button(
+                "✨ Muat Turun Surat Permohonan (Auto-isi)",
+                buf,
+                file_name=f"SLI01_{u['student_id']}.docx",
+                type="primary",
+                disabled=not can_download_sli01
+            )
         except Exception as e:
             st.error(f"Gagal jana Surat Permohonan: {e}")
 
-with c2:
+with cB:
     if not os.path.exists(tmpl_sli3):
         st.error("Template SLI-03 tidak ditemui. Letak di `templates/SLI03_Surat_Penempatan.docx`.")
-    elif need_bli03:
-        st.warning("Lengkapkan BLI-03 dahulu (organisasi/penyelia industri) untuk auto-isi Surat Penempatan.")
     else:
+        need_bli03 = not (plc_data.get("org_name") or "").strip()
+        if need_bli03:
+            st.info("Lengkapkan **BLI-03** dahulu (sekurang-kurangnya Nama Organisasi) untuk auto-isi Surat Penempatan.")
         try:
-            b = render_docx_from_template(tmpl_sli3, mapping_sli3)
-            st.download_button("✨ Muat Turun Surat Penempatan (Auto-isi)", b,
-                               file_name=f"SLI03_{u['student_id']}.docx", type="primary")
+            buf3 = render_docx_from_template(tmpl_sli3, mapping_sli3)
+            st.download_button(
+                "✨ Muat Turun Surat Penempatan (Auto-isi)",
+                buf3,
+                file_name=f"SLI03_{u['student_id']}.docx",
+                type="primary",
+                disabled=need_bli03
+            )
         except Exception as e:
             st.error(f"Gagal jana Surat Penempatan: {e}")
 
 # -------------------- Logout --------------------
 st.divider()
 if st.button("Log Keluar"):
-    st.session_state.auth = None
-    st.rerun()
+    st.session_state.auth = None; st.rerun()
