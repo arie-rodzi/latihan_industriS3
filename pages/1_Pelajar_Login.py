@@ -56,7 +56,7 @@ with get_conn() as conn:
     repin = one(conn, "SELECT COUNT(1) FROM reporting_in WHERE student_id=?", (user['user_id'],))
     logs  = one(conn, "SELECT COUNT(1) FROM logbook WHERE student_id=?", (user['user_id'],))
     rep   = one(conn, "SELECT COUNT(1) FROM final_reports WHERE student_id=?", (user['user_id'],))
-    ind   = one(conn, "SELECT COUNT(1) FROM bli05_industry WHERE student_id=?", (user['user_id'],))
+    ind   = one(conn, "SELECT COUNT(1) FROM bli05_industry WHERE student_user_id=? AND term_id=?", (user['user_id'], term_id)) or 0
     aca   = one(conn, "SELECT COUNT(1) FROM bli08_academic WHERE student_id=?", (user['user_id'],))
 
 col1, col2, col3 = st.columns(3)
