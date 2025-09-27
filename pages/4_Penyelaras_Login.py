@@ -1,10 +1,10 @@
 # pages/4_Penyelaras_Dashboard.py
-import os, io, math, hashlib, json
+import os, io, math, hashlib
 import pandas as pd
 import streamlit as st
 from lib.common import ensure_db, auth_email_or_sid, get_conn, one, term_label
 
-# ============== Setup asas ==============
+# ================= Setup asas =================
 st.set_page_config(page_title="Penyelaras", page_icon="⚙️", layout="wide")
 st.title("Dashboard Penyelaras")
 
@@ -33,7 +33,7 @@ if not st.session_state.auth:
 # ---------------------- Selepas login: program & term ----------------------
 user = st.session_state.auth
 
-# Tetapkan program penyelaras (fallback demo jika None) dan simpan balik supaya konsisten
+# Tetapkan program penyelaras (fallback demo jika None) dan simpan balik
 program_managed = (user.get("program_code") or "").strip()
 if not program_managed:
     program_managed = "CS241"
@@ -75,7 +75,7 @@ def read_any_table(uploaded_file) -> pd.DataFrame:
         if name.endswith(".csv"):
             return pd.read_csv(uploaded_file)
         try:
-            import openpyxl  # noqa: F401
+            import openpyxl  # noqa
             return pd.read_excel(uploaded_file)
         except Exception:
             uploaded_file.seek(0); return pd.read_csv(uploaded_file)
@@ -86,94 +86,106 @@ def require_cols(df: pd.DataFrame, cols: list[str]) -> tuple[bool, str]:
     missing = [c for c in cols if c not in df.columns]
     return (len(missing)==0, ", ".join(missing))
 
-# ---------------------- Seeder / Fix kelas ----------------------
+# ---------------------- Seeder 25/kelas (50 total) ----------------------
 ensure_users_has_class_section()
 
 def seed_or_fix_classes_for_program(program_code: str, term_id: int) -> str:
     """
-    Jika tiada pelajar → jana 60 pelajar demo ({PROGRAM}7A/7B) + placements + padanan industri (Kumar/Lim).
-    Jika ada pelajar tetapi tiada class_section → pecahkan semua ke {PROGRAM}7A/7B.
-    Jika class_section sedia ada → biarkan.
+    Sasaran demo: 25 pelajar utk {PROGRAM}7A dan 25 pelajar utk {PROGRAM}7B (total 50).
+    - Jika tiada pelajar → cipta 50 (25/kelas).
+    - Jika ada tapi tiada class_section → bahagikan ke 7A/7B kemudian top-up hingga 25/kelas.
+    - Tambah placements & padanan industri (Kumar/Lim) jika belum ada utk term ini.
     """
+    target_per_class = 25
+    secA, secB = f"{program_code}7A", f"{program_code}7B"
+
     with get_conn() as conn:
         cur = conn.cursor()
-        # Ada pelajar program ni?
-        cur.execute("SELECT COUNT(1) FROM users WHERE role_id=1 AND program_code=?", (program_code,))
-        total = int(cur.fetchone()[0])
+        # Dapatkan senarai pelajar semasa
+        df = pd.read_sql_query("""
+            SELECT user_id, student_id, COALESCE(class_section,'') AS cs
+            FROM users WHERE role_id=1 AND program_code=?
+            ORDER BY CAST(student_id AS TEXT)
+        """, conn, params=(program_code,))
+        total = len(df)
 
-        if total == 0:
-            # SEED 60 pelajar demo
-            base = 2025000
-            for i in range(1, 61):
-                sid = str(base + i)
-                name = f"Pelajar {program_code} #{i:02d}"
+        def _create_students(n, section, start_sid):
+            for i in range(n):
+                sid = str(start_sid + i)
+                name = f"Pelajar {program_code} #{sid[-2:]}"
                 email = f"{sid}@student.uitm.edu.my"
-                section = f"{program_code}7A" if i <= 30 else f"{program_code}7B"
                 cur.execute("""
                     INSERT INTO users(full_name, email, role_id, program_code, student_id, class_section, password_hash, is_active)
                     VALUES (?,?,?,?,?,?,?,1)
                 """, (name, email, 1, program_code, sid, section, _sha("DEFAULT123")))
             conn.commit()
 
-            # Pastikan industry SV wujud
-            def _get_or_create_user(email, full_name, role_id, program=None):
-                cur.execute("SELECT user_id FROM users WHERE email=?", (email,))
-                r = cur.fetchone()
-                if r: return int(r[0])
-                cur.execute("""
-                    INSERT INTO users(full_name, email, role_id, program_code, password_hash, is_active)
-                    VALUES (?,?,?,?,?,1)
-                """, (full_name, email, role_id, program, _sha("DEFAULT123")))
+        if total == 0:
+            base = 20252000
+            _create_students(target_per_class, secA, base+1)
+            _create_students(target_per_class, secB, base+1+target_per_class)
+        else:
+            # Jika tiada class_section langsung → bahagikan separuh ke A/B
+            if not any(df["cs"].str.strip()):
+                half = (total + 1)//2
+                idsA = df.iloc[:half]["user_id"].tolist()
+                idsB = df.iloc[half:]["user_id"].tolist()
+                if idsA:
+                    cur.execute(f"UPDATE users SET class_section=? WHERE user_id IN ({','.join(['?']*len(idsA))})",
+                                (secA, *idsA))
+                if idsB:
+                    cur.execute(f"UPDATE users SET class_section=? WHERE user_id IN ({','.join(['?']*len(idsB))})",
+                                (secB, *idsB))
                 conn.commit()
-                return cur.lastrowid
 
-            kumar_id = _get_or_create_user("kumar@industry.com", "Encik Kumar", 4, None)
-            lim_id   = _get_or_create_user("lim@industry.com",   "Encik Lim",   4, None)
+            # Top-up setiap kelas hinggalah 25
+            countA = one(conn, "SELECT COUNT(1) FROM users WHERE role_id=1 AND program_code=? AND class_section=?",
+                         (program_code, secA)) or 0
+            countB = one(conn, "SELECT COUNT(1) FROM users WHERE role_id=1 AND program_code=? AND class_section=?",
+                         (program_code, secB)) or 0
+            base = int(one(conn, "SELECT COALESCE(MAX(CAST(student_id AS INTEGER)), 20252000) FROM users", ())) or 20252000
+            if countA < target_per_class:
+                _create_students(target_per_class - countA, secA, base+1); base += (target_per_class - countA)
+            if countB < target_per_class:
+                _create_students(target_per_class - countB, secB, base+1); base += (target_per_class - countB)
 
-            # Placements + padan industri selang-seli
-            df_stu = pd.read_sql_query("""
-                SELECT user_id, student_id FROM users
-                WHERE role_id=1 AND program_code=? ORDER BY student_id
-            """, conn, params=(program_code,))
-            for idx, r in df_stu.iterrows():
-                cur.execute("""
-                    INSERT INTO placements(student_id, org_name, address, contact_person, contact_email, contact_phone, term_id, created_at)
-                    VALUES (?,?,?,?,?,?,?, datetime('now'))
-                """, (int(r["user_id"]), f"Syarikat Demo #{idx+1:02d}", "Alamat Demo",
-                      "Penyelia Syarikat", "pic@demo.com", "03-12345678", term_id))
+        # Pastikan penyelia industri demo wujud
+        def _get_or_create_user(email, full_name, role_id):
+            cur.execute("SELECT user_id FROM users WHERE email=?", (email,))
+            r = cur.fetchone()
+            if r: return int(r[0])
+            cur.execute("""INSERT INTO users(full_name, email, role_id, password_hash, is_active)
+                           VALUES (?,?,?,?,1)""", (full_name, email, role_id, _sha("DEFAULT123")))
+            conn.commit(); return cur.lastrowid
+
+        kumar_id = _get_or_create_user("kumar@industry.com", "Encik Kumar", 4)
+        lim_id   = _get_or_create_user("lim@industry.com",   "Encik Lim",   4)
+
+        # Tambah placements & padanan industri (skip jika sudah ada)
+        df_stu = pd.read_sql_query("""
+            SELECT u.user_id FROM users u
+            WHERE u.role_id=1 AND u.program_code=? AND u.class_section IN (?,?)
+            ORDER BY CAST(u.student_id AS TEXT)
+        """, conn, params=(program_code, secA, secB))
+        for idx, r in df_stu.iterrows():
+            uid = int(r["user_id"])
+            # placements
+            cur.execute("SELECT 1 FROM placements WHERE student_id=? AND term_id=? LIMIT 1", (uid, term_id))
+            if not cur.fetchone():
+                cur.execute("""INSERT INTO placements(student_id, org_name, address, contact_person, contact_email, contact_phone, term_id, created_at)
+                               VALUES (?,?,?,?,?,?,?, datetime('now'))""",
+                            (uid, f"Syarikat Demo #{idx+1:02d}", "Alamat Demo",
+                             "Penyelia Syarikat", "pic@demo.com", "03-12345678", term_id))
+            # padan industri
+            cur.execute("""SELECT 1 FROM supervisor_assignments 
+                           WHERE student_user_id=? AND term_id=? LIMIT 1""", (uid, term_id))
+            if not cur.fetchone():
                 ind_id = kumar_id if (idx % 2 == 0) else lim_id
-                cur.execute("""
-                    INSERT INTO supervisor_assignments(student_user_id, acad_sv_user_id, ind_sv_user_id, program_code, term_id, assigned_at)
-                    VALUES (?,?,?,?,?, datetime('now'))
-                """, (int(r["user_id"]), None, ind_id, program_code, term_id))
-            conn.commit()
-            return f"SEED: 60 pelajar {program_code} (…7A/7B) + placements + padanan industri."
-
-        # Ada pelajar — semak class_section
-        df_have = pd.read_sql_query("""
-            SELECT COALESCE(class_section,'') AS cs
-            FROM users WHERE role_id=1 AND program_code=?
-        """, conn, params=(program_code,))
-        if not any(cs.strip() for cs in df_have["cs"].tolist()):
-            # pecahkan semua ke 7A/7B
-            df_sorted = pd.read_sql_query("""
-                SELECT user_id FROM users
-                WHERE role_id=1 AND program_code=?
-                ORDER BY CAST(student_id AS TEXT)
-            """, conn, params=(program_code,))
-            n = len(df_sorted); half = math.ceil(n/2)
-            idsA = df_sorted.iloc[:half]["user_id"].tolist()
-            idsB = df_sorted.iloc[half:]["user_id"].tolist()
-            secA, secB = f"{program_code}7A", f"{program_code}7B"
-            if idsA:
-                cur.execute(f"UPDATE users SET class_section=? WHERE user_id IN ({','.join(['?']*len(idsA))})",
-                            (secA, *idsA))
-            if idsB:
-                cur.execute(f"UPDATE users SET class_section=? WHERE user_id IN ({','.join(['?']*len(idsB))})",
-                            (secB, *idsB))
-            conn.commit()
-            return f"ASSIGN: Tetapkan class_section untuk {n} pelajar → {secA} & {secB}."
-        return "OK: class_section sedia ada."
+                cur.execute("""INSERT INTO supervisor_assignments(student_user_id, acad_sv_user_id, ind_sv_user_id, program_code, term_id, assigned_at)
+                               VALUES (?,?,?,?,?, datetime('now'))""",
+                            (uid, None, ind_id, program_code, term_id))
+        conn.commit()
+    return f"OK: {secA} & {secB} dipastikan ≥25 pelajar setiap satu."
 
 msg_init = seed_or_fix_classes_for_program(program_managed, term_id)
 st.caption(f"Init kelas: {msg_init}")
@@ -184,7 +196,6 @@ st.divider()
 with get_conn() as conn:
     tlabel = term_label(conn)
     total_students = one(conn, "SELECT COUNT(1) FROM users WHERE role_id=1 AND program_code=?", (program_managed,)) or 0
-    total_acad = one(conn, "SELECT COUNT(1) FROM users WHERE role_id=3 AND program_code=?", (program_managed,)) or 0
     total_ind = one(conn, "SELECT COUNT(1) FROM users WHERE role_id=4") or 0
     placements_cnt = one(conn, "SELECT COUNT(1) FROM placements WHERE term_id=?", (term_id,)) or 0
     bli05 = one(conn, "SELECT COUNT(1) FROM bli05_industry WHERE term_id=?", (term_id,)) or 0
@@ -193,14 +204,12 @@ with get_conn() as conn:
 
 c1,c2,c3 = st.columns(3)
 c1.metric("Pelajar (program ini)", f"{total_students}")
-c2.metric("Penyelia Akademik (program ini)", f"{total_acad}")
-c3.metric("Penyelia Industri (semua)", f"{total_ind}")
+c2.metric("Penyelia Industri (semua)", f"{total_ind}")
+c3.metric("Penempatan (term ini)", f"{placements_cnt}")
 c4,c5,c6 = st.columns(3)
-c4.metric("Penempatan (term ini)", f"{placements_cnt}")
-c5.metric("BLI-05 (term ini)", f"{bli05}")
-c6.metric("BLI-08 (term ini)", f"{bli08}")
-c7,_,c9 = st.columns(3)
-c7.metric("Laporan Akhir (term ini)", f"{reports}")
+c4.metric("BLI-05 (term ini)", f"{bli05}")
+c5.metric("BLI-08 (term ini)", f"{bli08}")
+c6.metric("Laporan Akhir (term ini)", f"{reports}")
 
 st.divider()
 
@@ -214,21 +223,17 @@ with get_conn() as conn:
         ORDER BY class_section
     """, conn, params=(program_managed,))
 if df_sections.empty:
-    st.error("Tiada kelas ditemui untuk program ini walaupun selepas inisialisasi data.")
-    st.stop()
+    st.error("Tiada kelas ditemui untuk program ini."); st.stop()
 
 kelas_list = df_sections["class_section"].tolist()
 kelas = st.selectbox("Pilih KELAS", kelas_list, index=0)
 st.caption(f"Kelas dipilih: **{kelas}**")
 
-cls_filter = " AND u.class_section=? "
-cls_params = (kelas,)
-
 # ---------------------- Senarai Pelajar (kelas dipilih) ----------------------
 st.header("👥 Senarai Pelajar Kelas Ini")
 
 with get_conn() as conn:
-    sql_roster = f"""
+    sql_roster = """
         SELECT 
             u.user_id,
             u.student_id            AS no_pelajar,
@@ -236,44 +241,49 @@ with get_conn() as conn:
             u.program_code          AS program,
             COALESCE(u.class_section,'-') AS kelas,
             COALESCE(p.org_name,'-')     AS organisasi,
-            COALESCE(ind.full_name,'(tiada)')  AS penyelia_industri,
-            COALESCE(acad.full_name,'(tiada)') AS penyelia_akademik
+            COALESCE(ind.full_name,'(tiada)')  AS penyelia_industri
         FROM users u
         LEFT JOIN supervisor_assignments sa 
           ON sa.student_user_id=u.user_id AND sa.term_id=?
-        LEFT JOIN users acad ON acad.user_id = sa.acad_sv_user_id
         LEFT JOIN users ind  ON ind.user_id  = sa.ind_sv_user_id
         LEFT JOIN placements p 
           ON p.student_id=u.user_id AND p.term_id=?
-        WHERE u.role_id=1 AND u.program_code=? {cls_filter}
+        WHERE u.role_id=1 AND u.program_code=? AND u.class_section=?
         ORDER BY u.student_id
     """
-    params = (term_id, term_id, program_managed) + cls_params
-    df_roster = pd.read_sql_query(sql_roster, conn, params=params)
+    df_roster = pd.read_sql_query(sql_roster, conn, params=(term_id, term_id, program_managed, kelas))
 
 st.caption(f"Bilangan pelajar: **{len(df_roster)}**")
-st.dataframe(df_roster[["no_pelajar","nama_pelajar","program","kelas","organisasi","penyelia_industri","penyelia_akademik"]],
-             use_container_width=True, hide_index=True)
+st.dataframe(
+    df_roster[["no_pelajar","nama_pelajar","program","kelas","organisasi","penyelia_industri"]],
+    use_container_width=True, hide_index=True
+)
 st.download_button(
     "⬇️ Muat turun senarai pelajar (CSV)",
-    data=df_to_csv_bytes(df_roster[["no_pelajar","nama_pelajar","program","kelas","organisasi","penyelia_industri","penyelia_akademik"]]),
+    data=df_to_csv_bytes(df_roster[["no_pelajar","nama_pelajar","program","kelas","organisasi","penyelia_industri"]]),
     file_name=f"senarai_pelajar_{kelas.replace(' ','_')}.csv",
     mime="text/csv"
 )
 
 st.divider()
 
-# ---------------------- Muat naik pensyarah & PADANAN (kelas) ----------------------
+# ---------------------- Muat naik Pensyarah & PADANAN (kelas) ----------------------
 st.header("🧑‍🏫 Muat Naik Pensyarah Akademik & Jana Padanan (Kelas ini)")
+st.caption("**Templat (boleh buka dengan Excel)**: lajur **sv_email, full_name, max_students**.")
 
-st.caption("**Templat CSV/XLSX**: lajur **sv_email, full_name, max_students** (max_students opsyenal).")
-tmpl_sv = pd.DataFrame({"sv_email":[],"full_name":[],"max_students":[]})
-st.download_button("📥 Muat turun templat Pensyarah (CSV)",
-                   data=df_to_csv_bytes(tmpl_sv),
-                   file_name=f"template_pensyarah_{program_managed}.csv",
-                   mime="text/csv")
+tmpl_sv = pd.DataFrame({
+    "sv_email": ["ahmad@uitm.edu.my", "zuraida@uitm.edu.my", "lee@uitm.edu.my"],
+    "full_name": ["En. Ahmad", "Pn. Zuraida", "En. Lee"],
+    "max_students": [12, 12, 12]
+})
+st.download_button(
+    "📥 Muat turun templat Pensyarah (CSV)",
+    data=df_to_csv_bytes(tmpl_sv),
+    file_name=f"template_pensyarah_{program_managed}_{kelas}.csv",
+    mime="text/csv"
+)
 
-up_acad = st.file_uploader("Muat naik senarai pensyarah (CSV/XLSX) — untuk program ini", key="acad_csv")
+up_acad = st.file_uploader("Muat naik senarai pensyarah (CSV/XLSX) — padanan untuk kelas ini", key="acad_csv")
 df_acad = read_any_table(up_acad)
 if not df_acad.empty:
     ok, miss = require_cols(df_acad, ["sv_email","full_name"])
@@ -316,7 +326,7 @@ if st.button("⚖️ Jana & Simpan Padanan Akademik (kelas ini)"):
         df_sv["max_students"] = pd.to_numeric(df_sv["max_students"], errors="coerce").fillna(999).astype(int)
         df_sv["assigned"] = 0
 
-        # Buang assignment akademik lama untuk kelas ini pada term ini (Industri dikekalkan)
+        # Buang assignment akademik lama untuk kelas ini pada term ini (industri kekal)
         with get_conn() as conn:
             cur = conn.cursor()
             cur.execute("""
@@ -346,7 +356,7 @@ if st.button("⚖️ Jana & Simpan Padanan Akademik (kelas ini)"):
 
         df_assigned = pd.DataFrame(assigned)
 
-        # Simpan → supervisor_assignments
+        # Simpan assignment akademik
         with get_conn() as conn:
             cur = conn.cursor()
             for _, r in df_assigned.iterrows():
@@ -357,7 +367,7 @@ if st.button("⚖️ Jana & Simpan Padanan Akademik (kelas ini)"):
                 """, (int(r["student_user_id"]), acad_id, None, program_managed, term_id))
             conn.commit()
 
-        st.success(f"Padanan disimpan untuk kelas {kelas}.")
+        st.success(f"Padanan akademik disimpan untuk kelas {kelas}.")
         st.download_button(
             "⬇️ Muat turun CSV padanan",
             data=df_to_csv_bytes(df_assigned[["student_id","acad_sv_email","acad_sv_name"]]),
@@ -370,9 +380,8 @@ st.divider()
 
 # ---------------------- Senarai Penyelia Industri (kelas) ----------------------
 st.header("🏭 Senarai Penyelia Industri — Kelas Ini")
-
 with get_conn() as conn:
-    sql_indlist = f"""
+    df_indlist = pd.read_sql_query("""
         SELECT 
           COALESCE(ind.full_name,'(tiada)') AS nama_penyelia_industri,
           COALESCE(ind.email,'-')          AS emel_penyelia_industri,
@@ -381,12 +390,10 @@ with get_conn() as conn:
         LEFT JOIN supervisor_assignments sa 
           ON sa.student_user_id=u.user_id AND sa.term_id=?
         LEFT JOIN users ind ON ind.user_id=sa.ind_sv_user_id
-        WHERE u.role_id=1 AND u.program_code=? {cls_filter}
+        WHERE u.role_id=1 AND u.program_code=? AND u.class_section=?
         GROUP BY ind.user_id, ind.full_name, ind.email
         ORDER BY bil_pelajar DESC, nama_penyelia_industri
-    """
-    params = (term_id, program_managed) + cls_params
-    df_indlist = pd.read_sql_query(sql_indlist, conn, params=params)
+    """, conn, params=(term_id, program_managed, kelas))
 
 st.dataframe(df_indlist, use_container_width=True, hide_index=True)
 st.download_button(
@@ -435,7 +442,6 @@ with get_conn() as conn:
         sql = f"SELECT id, student_user_id AS user_id, total AS ind_score FROM bli05_industry WHERE id IN ({','.join(['?']*len(ids))})"
         df_ind = pd.read_sql_query(sql, conn, params=ids)
 
-# Merge & papar
 dfm = df_students.merge(df_acad, on="user_id", how="left").merge(df_ind, on="user_id", how="left")
 dfm["acad_score"] = pd.to_numeric(dfm["acad_score"], errors="coerce").fillna(0.0)
 dfm["ind_score"]  = pd.to_numeric(dfm["ind_score"],  errors="coerce").fillna(0.0)
