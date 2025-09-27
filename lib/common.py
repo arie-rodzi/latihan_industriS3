@@ -1,9 +1,8 @@
-
-
-import sqlite3, os, hashlib, io
+# lib/common.py
+import sqlite3, os, hashlib, io, re
 
 DB_PATH = os.environ.get("DB_PATH", "mytimes.db")
-ROLES = {1:"student",2:"coordinator",3:"acad_sv",4:"ind_sv"}
+ROLES = {1: "student", 2: "coordinator", 3: "acad_sv", 4: "ind_sv"}
 
 def sha256(pw: str) -> str:
     return hashlib.sha256(pw.encode("utf-8")).hexdigest()
@@ -39,15 +38,25 @@ def auth_email_or_sid(login_text: str, password: str):
         candidate = f"{sid.lower()}@student.uitm.edu.my"
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT user_id, full_name, role_id, program_code, password_hash FROM users WHERE email=? AND is_active=1", (candidate,))
+        cur.execute(
+            "SELECT user_id, full_name, role_id, program_code, password_hash "
+            "FROM users WHERE email=? AND is_active=1", (candidate,)
+        )
         row = cur.fetchone()
         if not row and sid:
-            cur.execute("SELECT user_id, full_name, role_id, program_code, password_hash FROM users WHERE student_id=? AND is_active=1", (sid,))
+            cur.execute(
+                "SELECT user_id, full_name, role_id, program_code, password_hash "
+                "FROM users WHERE student_id=? AND is_active=1", (sid,)
+            )
             row = cur.fetchone()
         if not row: return None
         user_id, full_name, role_id, program_code, ph = row
         if ph == sha256(password):
-            return {"user_id":user_id,"full_name":full_name,"role_id":role_id,"role_name":ROLES.get(role_id,"?"),"program_code":program_code}
+            return {
+                "user_id": user_id, "full_name": full_name,
+                "role_id": role_id, "role_name": ROLES.get(role_id, "?"),
+                "program_code": program_code
+            }
     return None
 
 def one(conn, sql, params=()):
@@ -61,26 +70,86 @@ def term_label(conn):
     except Exception:
         return "-"
 
-# DOCX helpers (optional; used by student auto-generate letters)
-def _replace_runs_with_placeholders(doc, mapping):
-    def _replace_in_para(para):
-        text = "".join(run.text for run in para.runs) or para.text
-        if not text: return
-        original = text
-        for k, v in mapping.items():
-            text = text.replace("{{"+k+"}}", str(v))
-        if text != original:
-            while para.runs:
-                para._p.remove(para.runs[0]._r)
-            para.add_run(text)
-    for p in doc.paragraphs: _replace_in_para(p)
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs: _replace_in_para(p)
+# ---------------- DOCX helpers (robust, all parts) ----------------
+def _compile_token_patterns(mapping_keys):
+    """
+    Build regex patterns for each KEY to match:
+      {{ KEY }}, « KEY », << KEY >>
+    with optional spaces around the KEY.
+    """
+    patterns = {}
+    for k in mapping_keys:
+        # escape key for regex
+        key = re.escape(k)
+        patterns[k] = [
+            re.compile(r"\{\{\s*" + key + r"\s*\}\}"),      # {{ KEY }}
+            re.compile(r"«\s*" + key + r"\s*»"),            # « KEY »
+            re.compile(r"<<\s*" + key + r"\s*>>"),          # << KEY >>
+        ]
+    return patterns
+
+def _replace_in_text_node(txt, patterns, values_by_key):
+    """
+    Replace placeholders in a single text node string.
+    """
+    if txt is None:
+        return txt
+    out = txt
+    for k, regs in patterns.items():
+        val = "" if values_by_key.get(k) is None else str(values_by_key[k])
+        for rgx in regs:
+            out = rgx.sub(val, out)
+    return out
+
+def _replace_in_part_xml(part, patterns, values_by_key):
+    """
+    Replace in all w:t nodes of a given part (body/header/footer/etc).
+    This catches paragraphs, tables, headers/footers, and most text boxes.
+    """
+    try:
+        from docx.oxml.ns import qn
+        # All text nodes
+        t_nodes = part.element.xpath(".//w:t", namespaces=part.element.nsmap)
+        for t in t_nodes:
+            t.text = _replace_in_text_node(t.text, patterns, values_by_key)
+    except Exception:
+        pass
+
+def _replace_runs_with_placeholders(doc, mapping: dict):
+    """
+    Replace placeholders across ALL document parts:
+    - main document body
+    - headers & footers of all sections
+    - and any related parts that expose XML with w:t nodes (e.g., text boxes)
+    """
+    patterns = _compile_token_patterns(mapping.keys())
+
+    # main body
+    _replace_in_part_xml(doc.part, patterns, mapping)
+
+    # headers/footers of each section
+    for section in doc.sections:
+        if section.header and getattr(section.header, "part", None):
+            _replace_in_part_xml(section.header.part, patterns, mapping)
+        if section.footer and getattr(section.footer, "part", None):
+            _replace_in_part_xml(section.footer.part, patterns, mapping)
+
+    # other related parts (e.g., text boxes can live in separate drawing parts)
+    for rel in list(getattr(doc.part, "related_parts", {}).values()):
+        if hasattr(rel, "element"):
+            _replace_in_part_xml(rel, patterns, mapping)
 
 def render_docx_from_template(template_path: str, mapping: dict) -> bytes:
+    """
+    Load a .docx template and replace placeholders with mapping values.
+    Supports tokens in {{KEY}}, «KEY», <<KEY>> formats (with optional spaces).
+    Replaces in body, tables, headers/footers, and most text boxes.
+    """
     from docx import Document
-    if not os.path.exists(template_path): raise FileNotFoundError(template_path)
-    doc = Document(template_path); _replace_runs_with_placeholders(doc, mapping)
-    import io; bio = io.BytesIO(); doc.save(bio); return bio.getvalue()
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(template_path)
+    doc = Document(template_path)
+    _replace_runs_with_placeholders(doc, mapping)
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
