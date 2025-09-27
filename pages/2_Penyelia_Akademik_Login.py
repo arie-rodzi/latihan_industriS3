@@ -1,28 +1,35 @@
 # pages/2_Penyelia_Akademik_Dashboard.py
 import os
+import json
 import pandas as pd
 import streamlit as st
-from io import BytesIO
 from lib.common import ensure_db, auth_email_or_sid, get_conn, one, term_label
 
-# ---- Setup
+# ----------------------------- Setup -----------------------------
 st.set_page_config(page_title="Penyelia Akademik", page_icon="📘", layout="wide")
 st.title("Dashboard Penyelia Akademik")
 
 try:
     ensure_db(os.path.join(os.path.dirname(__file__), "..", "init_mytimes_fyp.sql"))
 except Exception as e:
-    st.error(f"Ralat DB: {e}"); st.stop()
+    st.error(f"Ralat DB: {e}")
+    st.stop()
 
-# ---- Guard util
+# ----------------------- Util & Guard ---------------------------
 def require_role(roles):
     aut = st.session_state.get("auth")
     if not aut or aut.get("role_name") not in roles:
         st.error("Akses tidak dibenarkan. Sila log masuk sebagai Penyelia Akademik.")
         st.stop()
 
-# ---- Login
-if "auth" not in st.session_state: st.session_state.auth = None
+def radio_default(key, default):
+    """Helper untuk dapatkan nilai default radio yang stabil."""
+    return st.session_state.get(key, default)
+
+# --------------------------- Login ------------------------------
+if "auth" not in st.session_state:
+    st.session_state.auth = None
+
 if not st.session_state.auth:
     st.subheader("Log Masuk Penyelia Akademik")
     with st.form("login_acad"):
@@ -31,18 +38,19 @@ if not st.session_state.auth:
         submitted = st.form_submit_button("Log Masuk")
     if submitted:
         user = auth_email_or_sid(email, password)
-        if not user or user["role_name"]!="acad_sv":
-            st.error("Akaun bukan Penyelia Akademik / salah maklumat.")
+        if not user or user.get("role_name") != "acad_sv":
+            st.error("Akaun bukan Penyelia Akademik / maklumat log masuk tidak sah.")
         else:
-            st.session_state.auth = user; st.rerun()
+            st.session_state.auth = user
+            st.rerun()
     st.stop()
 
-# ---- Guard role
+# ------------------------ Role Check ----------------------------
 require_role(["acad_sv"])
 user = st.session_state.auth
 st.success(f"Log masuk sebagai {user['full_name']}")
 
-# ---- Pastikan jadual penting wujud
+# ------------------------ DB Bootstrap --------------------------
 with get_conn() as conn:
     cur = conn.cursor()
     cur.execute("""
@@ -62,13 +70,13 @@ with get_conn() as conn:
             student_user_id INTEGER NOT NULL,
             acad_supervisor_id INTEGER NOT NULL,
             term_id INTEGER,
-            score_komunikasi REAL DEFAULT 0,
-            score_disiplin REAL DEFAULT 0,
-            score_kualiti REAL DEFAULT 0,
-            score_kehadiran REAL DEFAULT 0,
-            score_inisiatif REAL DEFAULT 0,
-            komen_umum TEXT,
-            total REAL DEFAULT 0,
+            score_komunikasi REAL DEFAULT 0,   -- guna utk CLO1 (30%)
+            score_disiplin REAL DEFAULT 0,     -- guna utk CLO5 Logbook (10%)
+            score_kualiti REAL DEFAULT 0,      -- guna utk CLO4 (30%)
+            score_kehadiran REAL DEFAULT 0,    -- tidak digunakan di versi ini
+            score_inisiatif REAL DEFAULT 0,    -- tidak digunakan di versi ini
+            komen_umum TEXT,                   -- simpan JSON butiran BLI-08 + komen
+            total REAL DEFAULT 0,              -- jumlah 70% utk komponen ini
             submitted_at TEXT,
             updated_at TEXT DEFAULT (datetime('now'))
         )
@@ -84,59 +92,95 @@ with get_conn() as conn:
             acad_status TEXT
         )
     """)
-    # Kolum komen logbook jika belum ada
+    # Tambah kolum komen logbook jika tiada
     cur.execute("PRAGMA table_info(logbook)")
     cols = {r[1] for r in cur.fetchall()}
-    if "acad_comment" not in cols:      cur.execute("ALTER TABLE logbook ADD COLUMN acad_comment TEXT")
-    if "acad_commented_by" not in cols: cur.execute("ALTER TABLE logbook ADD COLUMN acad_commented_by INTEGER")
-    if "acad_commented_at" not in cols: cur.execute("ALTER TABLE logbook ADD COLUMN acad_commented_at TEXT")
+    if "acad_comment" not in cols:
+        cur.execute("ALTER TABLE logbook ADD COLUMN acad_comment TEXT")
+    if "acad_commented_by" not in cols:
+        cur.execute("ALTER TABLE logbook ADD COLUMN acad_commented_by INTEGER")
+    if "acad_commented_at" not in cols:
+        cur.execute("ALTER TABLE logbook ADD COLUMN acad_commented_at TEXT")
     conn.commit()
 
-# ---- Term semasa
+# --------------------------- Term Now ---------------------------
 with get_conn() as conn:
     tlabel = term_label(conn)
-    df_term = pd.read_sql_query("SELECT term_id FROM terms ORDER BY term_id DESC LIMIT 1", conn)
+    df_term = pd.read_sql_query(
+        "SELECT term_id FROM terms ORDER BY term_id DESC LIMIT 1", conn
+    )
 term_id = int(df_term.iloc[0]["term_id"]) if not df_term.empty else None
 st.caption(f"**Sesi:** {tlabel or '-'}")
 if not term_id:
-    st.warning("Tiada term aktif."); st.stop()
+    st.warning("Tiada term aktif.")
+    st.stop()
 
-# ---- Senarai pelajar di bawah jagaan penyelia ini
+# ---------------------- Senarai Pelajar -------------------------
 with get_conn() as conn:
     df_stu = pd.read_sql_query(
-        """SELECT u.user_id, u.full_name, u.student_id, u.program_code
-           FROM supervisor_assignments sa
-           JOIN users u ON u.user_id = sa.student_user_id
-           WHERE sa.term_id=? AND sa.acad_sv_user_id=?
-           ORDER BY u.full_name""",
+        """
+        SELECT u.user_id, u.full_name, u.student_id, u.program_code
+        FROM supervisor_assignments sa
+        JOIN users u ON u.user_id = sa.student_user_id
+        WHERE sa.term_id=? AND sa.acad_sv_user_id=?
+        ORDER BY u.full_name
+        """,
         conn, params=(term_id, user['user_id'])
     )
 
 if df_stu.empty:
     st.info("Tiada pelajar di bawah jagaan anda.")
-    if st.button("Log Keluar"): st.session_state.auth=None; st.rerun()
+    if st.button("Log Keluar"):
+        st.session_state.auth = None
+        st.rerun()
     st.stop()
 
 st.subheader("Pelajar Diselia")
-st.dataframe(df_stu, use_container_width=True)
 
+# Carian pantas & pemilih pelajar (fokus satu pelajar)
+col_find, col_sel = st.columns([1, 2])
+with col_find:
+    q = st.text_input("Cari nama/ID", value="", help="Taip sebahagian nama atau nombor matrik")
+df_view = df_stu[
+    df_stu.apply(lambda r: q.lower() in (f"{r['student_id']} {r['full_name']}".lower()), axis=1)
+] if q else df_stu
+
+options = [
+    (int(r.user_id), f"{r.student_id} — {r.full_name} ({r.program_code or '-'})")
+    for _, r in df_view.iterrows()
+]
+if not options:
+    st.warning("Tiada padanan carian.")
+    st.stop()
+
+with col_sel:
+    default_idx = 0
+    for i, (_, label) in enumerate(options):
+        if "nurhidayah" in label.lower():
+            default_idx = i
+            break
+    sel_stu = st.selectbox("Pilih pelajar", options=options, index=default_idx, format_func=lambda x: x[1], key="sel_pelajar")
+
+st.dataframe(df_view, use_container_width=True)
 st.divider()
 
-# ---------- LOOP: panel setiap pelajar ----------
-for row in df_stu.itertuples(index=False):
-    stu_id = int(row.user_id)
-    stu_label = f"{row.student_id} — {row.full_name} ({row.program_code or '-'})"
-    with st.expander(f"👨‍🎓 {stu_label}", expanded=False):
+# -------------------- Panel Pelajar (Tabs) ----------------------
+stu_id = sel_stu[0]
+stu_label = sel_stu[1]
+with st.expander(f"👨‍🎓 {stu_label}", expanded=True):
+    tab_log, tab_rep, tab_bli = st.tabs(["📒 Logbook", "📄 Laporan Akhir", "📝 BLI-08 (Penyelia Akademik)"])
 
-        # 1) LOGBOOK + KOMEN (tanpa expander bertingkat)
-        st.markdown("### 📒 Logbook & Komen")
+    # ======================= TAB: LOGBOOK =======================
+    with tab_log:
         with get_conn() as conn:
             df_logs = pd.read_sql_query(
-                """SELECT log_id, entry_date, title, activities, outcomes, hours,
-                          COALESCE(acad_comment,'') AS acad_comment
-                   FROM logbook
-                   WHERE student_id=? AND term_id=?
-                   ORDER BY entry_date DESC""",
+                """
+                SELECT log_id, entry_date, title, activities, outcomes, hours,
+                       COALESCE(acad_comment,'') AS acad_comment
+                FROM logbook
+                WHERE student_id=? AND term_id=?
+                ORDER BY entry_date DESC
+                """,
                 conn, params=(stu_id, term_id)
             )
 
@@ -146,23 +190,23 @@ for row in df_stu.itertuples(index=False):
         else:
             st.dataframe(df_logs[["entry_date","title","hours","acad_comment"]], use_container_width=True)
 
-            # Pilih satu entri untuk butiran (ELAK nested expander)
-            options = [
+            # Pilih satu entri untuk lihat butiran dan beri komen
+            options_logs = [
                 (int(r.log_id), f"{r.entry_date} — {r.title or '-'}")
                 for r in df_logs.itertuples(index=False)
             ]
-            selected = st.selectbox(
+            sel_log = st.selectbox(
                 "Pilih entri untuk lihat butiran",
-                options=options,
+                options=options_logs,
                 format_func=lambda x: x[1],
                 key=f"sel_log_{stu_id}"
             )
-            if selected:
-                sel_id = selected[0]
-                rlog = df_logs[df_logs["log_id"] == sel_id].iloc[0]
+            if sel_log:
+                sel_log_id = sel_log[0]
+                rlog = df_logs[df_logs["log_id"] == sel_log_id].iloc[0]
 
-                details = st.container()
-                with details:
+                box = st.container()
+                with box:
                     st.markdown(f"**Entri:** {rlog['entry_date']} — {rlog['title'] or '-'}")
                     st.markdown("**Aktiviti**")
                     st.write(rlog["activities"] or "-")
@@ -178,35 +222,44 @@ for row in df_stu.itertuples(index=False):
                         with get_conn() as conn:
                             cur = conn.cursor()
                             cur.execute(
-                                """UPDATE logbook
-                                   SET acad_comment=?, acad_commented_by=?, acad_commented_at=datetime('now')
-                                   WHERE log_id=?""",
+                                """
+                                UPDATE logbook
+                                SET acad_comment=?, acad_commented_by=?, acad_commented_at=datetime('now')
+                                WHERE log_id=?
+                                """,
                                 (new_c, user['user_id'], int(rlog["log_id"]))
                             )
                             conn.commit()
-                        st.success("Komen disimpan."); st.rerun()
+                        st.success("Komen disimpan.")
+                        st.rerun()
 
-        st.divider()
-
-        # 2) FINAL REPORT (download jika wujud blob)
-        st.markdown("### 📄 Laporan Akhir")
+    # ==================== TAB: LAPORAN AKHIR ====================
+    with tab_rep:
         with get_conn() as conn:
             df_rep = pd.read_sql_query(
-                """SELECT id, file_name, uploaded_at, LENGTH(file_blob) AS blob_len
-                   FROM final_reports WHERE student_id=? AND term_id=? ORDER BY uploaded_at DESC""",
+                """
+                SELECT id, file_name, uploaded_at, LENGTH(file_blob) AS blob_len
+                FROM final_reports
+                WHERE student_id=? AND term_id=?
+                ORDER BY uploaded_at DESC
+                """,
                 conn, params=(stu_id, term_id)
             )
+
         if df_rep.empty:
             st.info("Tiada muat naik Laporan Akhir untuk pelajar ini.")
         else:
             st.dataframe(df_rep[["file_name","uploaded_at","blob_len"]], use_container_width=True)
+
             with get_conn() as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    """SELECT file_name, file_blob
-                       FROM final_reports
-                       WHERE student_id=? AND term_id=?
-                       ORDER BY uploaded_at DESC LIMIT 1""",
+                    """
+                    SELECT file_name, file_blob
+                    FROM final_reports
+                    WHERE student_id=? AND term_id=?
+                    ORDER BY uploaded_at DESC LIMIT 1
+                    """,
                     (stu_id, term_id)
                 )
                 f = cur.fetchone()
@@ -216,59 +269,181 @@ for row in df_stu.itertuples(index=False):
             else:
                 st.info("Blob laporan tiada (repo simpan path sahaja).")
 
-        st.divider()
-
-        # 3) BLI-08 — PENILAIAN PENYELIA AKADEMIK
-        st.markdown("### 📝 BLI-08 — Penilaian Akademik (0–100)")
-
+    # ===================== TAB: BLI-08 (UiTM) ===================
+    with tab_bli:
+        st.info("Penilaian ini mengikut borang BLI-08 (skala 1–5 & 1–2) dan pemberat CLO sebagaimana borang rasmi.")
+        # Cuba muat semula nilai terakhir untuk prefill
         with get_conn() as conn:
-            df_bli08 = pd.read_sql_query(
-                """SELECT id, score_komunikasi, score_disiplin, score_kualiti, score_kehadiran, score_inisiatif,
-                          komen_umum, total, submitted_at
-                   FROM bli08_academic
-                   WHERE student_user_id=? AND term_id=? AND acad_supervisor_id=?
-                   ORDER BY id DESC LIMIT 1""",
+            df_bli_last = pd.read_sql_query(
+                """
+                SELECT id, komen_umum, score_komunikasi, score_disiplin, score_kualiti, total, submitted_at
+                FROM bli08_academic
+                WHERE student_user_id=? AND term_id=? AND acad_supervisor_id=?
+                ORDER BY id DESC LIMIT 1
+                """,
                 conn, params=(stu_id, term_id, user['user_id'])
             )
-        pref = df_bli08.iloc[0] if not df_bli08.empty else None
+        pref_json = {}
+        if not df_bli_last.empty and df_bli_last.iloc[0]["komen_umum"]:
+            try:
+                # komen_umum mungkin ada prefix "[BLI08]\n"
+                raw = df_bli_last.iloc[0]["komen_umum"]
+                start = raw.find("{")
+                if start >= 0:
+                    pref_json = json.loads(raw[start:])
+            except Exception:
+                pref_json = {}
 
-        colA, colB, colC = st.columns(3)
-        s1 = colA.number_input("Komunikasi (0–20)", 0.0, 20.0, float(pref["score_komunikasi"]) if pref is not None else 0.0, 1.0, key=f"s1_{stu_id}")
-        s2 = colA.number_input("Disiplin (0–20)",   0.0, 20.0, float(pref["score_disiplin"]) if pref is not None else 0.0, 1.0, key=f"s2_{stu_id}")
-        s3 = colB.number_input("Kualiti Kerja (0–30)", 0.0, 30.0, float(pref["score_kualiti"]) if pref is not None else 0.0, 1.0, key=f"s3_{stu_id}")
-        s4 = colB.number_input("Kehadiran (0–15)",  0.0, 15.0, float(pref["score_kehadiran"]) if pref is not None else 0.0, 1.0, key=f"s4_{stu_id}")
-        s5 = colC.number_input("Inisiatif (0–15)",  0.0, 15.0, float(pref["score_inisiatif"]) if pref is not None else 0.0, 1.0, key=f"s5_{stu_id}")
-        komen = st.text_area("Komen umum", value=(pref["komen_umum"] if pref is not None else ""), key=f"km_{stu_id}")
+        # -------- CLO1 (30%) : skala 1–5, 6 item --------
+        st.subheader("CLO1 — Penilaian Laporan Akhir (30%)")
+        clo1_items = [
+            "Pengenalan latihan industri",
+            "Latar belakang organisasi & tugasan",
+            "Laporan aktiviti (organisasi/jabatan yang ditempatkan)",
+            "Tugasan/Projek (permasalahan, objektif, skop)",
+            "Keberkesanan tugasan/projek kepada organisasi/komuniti",
+            "Kaedah kerja (pendekatan/kaedah/penyampaian maklumat)"
+        ]
+        clo1_scores = {}
+        for i, label in enumerate(clo1_items, start=1):
+            key_r = f"clo1_{stu_id}_{i}"
+            default = int(pref_json.get("CLO1", {}).get(f"CLO1_{i}", 3))
+            clo1_scores[f"CLO1_{i}"] = st.radio(
+                f"{i}. {label}",
+                options=[1,2,3,4,5],
+                horizontal=True,
+                index=[1,2,3,4,5].index(default),
+                key=key_r
+            )
+        clo1_raw = sum(clo1_scores.values())          # maks 30
+        clo1_weighted = clo1_raw / 30 * 30            # = clo1_raw
 
-        total = s1 + s2 + s3 + s4 + s5
-        st.metric("Jumlah Markah", f"{total:.1f} / 100", key=f"mt_{stu_id}")
+        st.caption(f"Jumlah CLO1: {clo1_raw}/30 → **{clo1_weighted:.1f} markah (30%)**")
+        st.divider()
+
+        # -------- CLO5 / Logbook (10%) : skala 1–2, 5 item --------
+        st.subheader("CLO5 — Penilaian Buku Log (10%)")
+        clo5_items = [
+            "Kekemasan catatan dalam buku log",
+            "Keupayaan menterjemah tugasan harian/mingguan ke buku log",
+            "Penulisan dan tatabahasa",
+            "Kandungan buku log secara keseluruhan",
+            "Disemak oleh penyelia industri secara berkala"
+        ]
+        clo5_scores = {}
+        for i, label in enumerate(clo5_items, start=1):
+            key_r = f"clo5_{stu_id}_{i}"
+            default = int(pref_json.get("CLO5", {}).get(f"CLO5_{i}", 1))
+            clo5_scores[f"CLO5_{i}"] = st.radio(
+                f"{i}. {label}",
+                options=[1,2],
+                horizontal=True,
+                index=[1,2].index(default),
+                key=key_r
+            )
+        clo5_raw = sum(clo5_scores.values())          # maks 10
+        clo5_weighted = clo5_raw / 10 * 10            # = clo5_raw
+        st.caption(f"Jumlah CLO5 (Logbook): {clo5_raw}/10 → **{clo5_weighted:.1f} markah (10%)**")
+        st.divider()
+
+        # -------- CLO4 (30%) : skala 1–2, 5 item; gandaan 3 --------
+        st.subheader("CLO4 — Penilaian Laporan Akhir (30%)")
+        clo4_items = [
+            "Maklumat bergambar, carta & lukisan berkaitan",
+            "Kelebihan daripada tugasan latihan industri",
+            "Kesimpulan & cadangan penambahbaikan",
+            "Persembahan laporan (format/konsisten/bahasa jelas)",
+            "Kekemasan format seperti ditetapkan penyelia"
+        ]
+        clo4_scores = {}
+        for i, label in enumerate(clo4_items, start=1):
+            key_r = f"clo4_{stu_id}_{i}"
+            default = int(pref_json.get("CLO4", {}).get(f"CLO4_{i}", 1))
+            clo4_scores[f"CLO4_{i}"] = st.radio(
+                f"{i}. {label}",
+                options=[1,2],
+                horizontal=True,
+                index=[1,2].index(default),
+                key=key_r
+            )
+        clo4_raw = sum(clo4_scores.values())          # maks 10
+        clo4_weighted = clo4_raw / 10 * 30            # skala ke 30%
+        st.caption(f"Jumlah CLO4: {clo4_raw}/10 → **{clo4_weighted:.1f} markah (30%)**")
+        st.divider()
+
+        # -------- Jumlah set komponen (70%) --------
+        total_70 = clo1_weighted + clo5_weighted + clo4_weighted
+        colA, colB = st.columns(2)
+        with colA:
+            st.metric("Jumlah BLI-08 (set ini)", f"{total_70:.1f} / 70")
+        with colB:
+            st.progress(min(max(total_70/70.0, 0.0), 1.0))
+
+        komen_bli = st.text_area(
+            "Komen umum (BLI-08)",
+            value=(st.session_state.get(f"komen_bli_{stu_id}", "")),
+            key=f"komen_bli_{stu_id}"
+        )
+
+        details_json = json.dumps({
+            "CLO1": clo1_scores,
+            "CLO5": clo5_scores,
+            "CLO4": clo4_scores,
+            "Totals": {
+                "CLO1_raw": clo1_raw, "CLO1_weighted": clo1_weighted,
+                "CLO5_raw": clo5_raw, "CLO5_weighted": clo5_weighted,
+                "CLO4_raw": clo4_raw, "CLO4_weighted": clo4_weighted,
+                "Grand_70": total_70
+            }
+        }, ensure_ascii=False)
 
         colX, colY = st.columns(2)
-        if colX.button("💾 Simpan Draf", key=f"draf_{stu_id}"):
+        if colX.button("💾 Simpan Draf (BLI-08)", key=f"draf_bli_{stu_id}"):
             with get_conn() as conn:
                 cur = conn.cursor()
                 cur.execute("""
-                    INSERT INTO bli08_academic(student_user_id, acad_supervisor_id, term_id,
+                    INSERT INTO bli08_academic(
+                        student_user_id, acad_supervisor_id, term_id,
                         score_komunikasi, score_disiplin, score_kualiti, score_kehadiran, score_inisiatif,
-                        komen_umum, total, submitted_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?, NULL, datetime('now'))
-                """, (stu_id, user['user_id'], term_id, s1, s2, s3, s4, s5, komen, total))
+                        komen_umum, total, submitted_at, updated_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?, NULL, datetime('now'))
+                """, (
+                    stu_id, user['user_id'], term_id,
+                    clo1_weighted,      # simpan di score_komunikasi
+                    clo5_weighted,      # simpan di score_disiplin
+                    clo4_weighted,      # simpan di score_kualiti
+                    0, 0,
+                    f"[BLI08]\n{details_json}\n\n{komen_bli}",
+                    total_70
+                ))
                 conn.commit()
-            st.success("Draf disimpan.")
+            st.success("Draf BLI-08 disimpan.")
             st.rerun()
 
-        if colY.button("✅ Hantar (Muktamad)", key=f"hantar_{stu_id}"):
+        if colY.button("✅ Hantar (Muktamad BLI-08)", key=f"hantar_bli_{stu_id}"):
             with get_conn() as conn:
                 cur = conn.cursor()
                 cur.execute("""
-                    INSERT INTO bli08_academic(student_user_id, acad_supervisor_id, term_id,
+                    INSERT INTO bli08_academic(
+                        student_user_id, acad_supervisor_id, term_id,
                         score_komunikasi, score_disiplin, score_kualiti, score_kehadiran, score_inisiatif,
-                        komen_umum, total, submitted_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'))
-                """, (stu_id, user['user_id'], term_id, s1, s2, s3, s4, s5, komen, total))
+                        komen_umum, total, submitted_at, updated_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'))
+                """, (
+                    stu_id, user['user_id'], term_id,
+                    clo1_weighted,
+                    clo5_weighted,
+                    clo4_weighted,
+                    0, 0,
+                    f"[BLI08]\n{details_json}\n\n{komen_bli}",
+                    total_70
+                ))
                 conn.commit()
-            st.success("Penilaian dihantar.")
+            st.success("Penilaian BLI-08 dihantar.")
             st.rerun()
 
+# --------------------------- Footer -----------------------------
 st.divider()
-if st.button("Log Keluar"): st.session_state.auth=None; st.rerun()
+if st.button("Log Keluar"):
+    st.session_state.auth = None
+    st.rerun()
