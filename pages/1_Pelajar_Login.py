@@ -1,12 +1,13 @@
 # pages/1_Pelajar_Login.py
 import os
+import json
 import datetime
 from datetime import date, datetime as dt
 import pandas as pd
 import streamlit as st
 
 from lib.common import (
-    ensure_db, auth_email_or_sid, ROLES,
+    ensure_db, auth_email_or_sid,
     get_conn, one, term_label, render_docx_from_template
 )
 
@@ -18,15 +19,25 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SQL_PATH = os.path.join(BASE_DIR, "..", "init_mytimes_fyp.sql")
 
 try:
-    ensure_db(SQL_PATH)  # make sure DB exists and schema is loaded
+    ensure_db(SQL_PATH)  # pastikan DB + skema wujud
 except Exception as e:
     st.error(f"Ralat DB: {e}")
     st.stop()
 
+# -------------------- Guard util --------------------
+def require_role(roles):
+    aut = st.session_state.get("auth")
+    if not aut or aut.get("role_name") not in roles:
+        st.error("Akses tidak dibenarkan di halaman Pelajar. Sila log masuk sebagai Pelajar.")
+        if st.button("Log Keluar"):
+            st.session_state.auth = None
+            st.rerun()
+        st.stop()
+
+# -------------------- Login --------------------
 if "auth" not in st.session_state:
     st.session_state.auth = None
 
-# -------------------- Login --------------------
 if not st.session_state.auth:
     with st.form("login"):
         login_text = st.text_input("Emel / No. Pelajar")
@@ -36,7 +47,7 @@ if not st.session_state.auth:
         user = auth_email_or_sid(login_text, password)
         if not user:
             st.error("Maklumat log masuk tidak sah.")
-        elif user["role_name"] != "student":
+        elif user.get("role_name") != "student":
             st.error("Akaun ini bukan peranan Pelajar.")
         else:
             st.session_state.auth = user
@@ -45,19 +56,29 @@ if not st.session_state.auth:
 
 # -------------------- Selepas login --------------------
 user = st.session_state.auth
+require_role(["student"])  # kunci peranan
 st.success(f"Log masuk sebagai {user['full_name']} ({user.get('program_code') or '-'})")
 
-# Metrics ringkas
+# -------------------- Term semasa (awal, sebelum metrik) --------------------
 with get_conn() as conn:
     tlabel = term_label(conn)
-    bli01 = one(conn, "SELECT COUNT(1) FROM bli01 WHERE student_id=?", (user['user_id'],))
-    bli02 = one(conn, "SELECT COUNT(1) FROM bli02_responses WHERE student_id=?", (user['user_id'],))
-    plc   = one(conn, "SELECT COUNT(1) FROM placements WHERE student_id=?", (user['user_id'],))
-    repin = one(conn, "SELECT COUNT(1) FROM reporting_in WHERE student_id=?", (user['user_id'],))
-    logs  = one(conn, "SELECT COUNT(1) FROM logbook WHERE student_id=?", (user['user_id'],))
-    rep   = one(conn, "SELECT COUNT(1) FROM final_reports WHERE student_id=?", (user['user_id'],))
+    df_term = pd.read_sql_query("SELECT term_id, start_date FROM terms ORDER BY term_id DESC LIMIT 1", conn)
+
+term_id = int(df_term.iloc[0]["term_id"]) if not df_term.empty else None
+if not term_id:
+    st.warning("Tiada term aktif.")
+    st.stop()
+
+# -------------------- Metrics ringkas --------------------
+with get_conn() as conn:
+    bli01 = one(conn, "SELECT COUNT(1) FROM bli01 WHERE student_id=? AND term_id=?", (user['user_id'], term_id)) or 0
+    bli02 = one(conn, "SELECT COUNT(1) FROM bli02_responses WHERE student_id=? AND term_id=?", (user['user_id'], term_id)) or 0
+    plc   = one(conn, "SELECT COUNT(1) FROM placements WHERE student_id=? AND term_id=?", (user['user_id'], term_id)) or 0
+    repin = one(conn, "SELECT COUNT(1) FROM reporting_in WHERE student_id=? AND term_id=?", (user['user_id'], term_id)) or 0
+    logs  = one(conn, "SELECT COUNT(1) FROM logbook WHERE student_id=? AND term_id=?", (user['user_id'], term_id)) or 0
+    rep   = one(conn, "SELECT COUNT(1) FROM final_reports WHERE student_id=? AND term_id=?", (user['user_id'], term_id)) or 0
     ind   = one(conn, "SELECT COUNT(1) FROM bli05_industry WHERE student_user_id=? AND term_id=?", (user['user_id'], term_id)) or 0
-    aca   = one(conn, "SELECT COUNT(1) FROM bli08_academic WHERE student_id=?", (user['user_id'],))
+    aca   = one(conn, "SELECT COUNT(1) FROM bli08_academic WHERE student_user_id=? AND term_id=?", (user['user_id'], term_id)) or 0
 
 col1, col2, col3 = st.columns(3)
 col1.metric("Sesi", tlabel)
@@ -76,19 +97,9 @@ st.divider()
 
 # -------------------- Borang Atas Talian --------------------
 st.markdown("## 📝 Borang Atas Talian")
-tabs = st.tabs([
-    "BLI-01 Maklumat Peribadi",
-    "BLI-03 Pengesahan Penempatan",
-    "BLI-04 Lapor Diri"
-])
+tabs = st.tabs(["BLI-01 Maklumat Peribadi", "BLI-03 Pengesahan Penempatan", "BLI-04 Lapor Diri"])
 
-# Dapatkan term semasa
-with get_conn() as conn:
-    term_id = pd.read_sql_query(
-        "SELECT term_id FROM terms ORDER BY term_id DESC LIMIT 1", conn
-    ).iloc[0]["term_id"]
-
-# --- BLI-01 (Maklumat Peribadi, online)
+# --- BLI-01 (Maklumat Peribadi)
 with tabs[0]:
     st.caption("Isi maklumat peribadi. Boleh kemas kini sebelum tarikh tutup.")
     with get_conn() as conn:
@@ -99,8 +110,7 @@ with tabs[0]:
     data_prefill = {}
     if not df_bli01.empty and df_bli01["data_json"].iloc[0]:
         try:
-            import json
-            data_prefill = json.loads(df_bli01["data_json"].iloc[0])
+            data_prefill = json.loads(df_bli01["data_json"].iloc[0]) or {}
         except Exception:
             data_prefill = {}
 
@@ -116,7 +126,6 @@ with tabs[0]:
         hantar_bli01 = st.form_submit_button("Simpan BLI-01")
 
     if hantar_bli01:
-        import json
         payload = {
             "nama": nama, "no_ic": no_ic, "no_tel": no_tel, "alamat": alamat,
             "program": program, "guardian": guardian, "guardian_tel": guardian_tel,
@@ -132,7 +141,7 @@ with tabs[0]:
         st.success("BLI-01 disimpan.")
         st.rerun()
 
-# --- BLI-03 (Pengesahan Penempatan, online)
+# --- BLI-03 (Pengesahan Penempatan)
 with tabs[1]:
     st.caption("Isi butiran penempatan praktikal/industri.")
     with get_conn() as conn:
@@ -142,18 +151,18 @@ with tabs[1]:
             WHERE student_id=? AND term_id=?
             ORDER BY id DESC LIMIT 1
         """, conn, params=(user["user_id"], term_id))
-    plc = df_plc.iloc[0].to_dict() if not df_plc.empty else {}
+    plc_prefill = df_plc.iloc[0].to_dict() if not df_plc.empty else {}
 
     with st.form("form_bli03"):
-        org_name = st.text_input("Nama Organisasi", value=plc.get("org_name", ""))
-        org_addr = st.text_area("Alamat Organisasi", value=plc.get("address", ""))
-        contact_person = st.text_input("Penyelia Industri (Nama)", value=plc.get("contact_person", ""))
-        contact_email  = st.text_input("Emel Penyelia Industri", value=plc.get("contact_email", ""))
-        contact_phone  = st.text_input("Telefon Penyelia Industri", value=plc.get("contact_phone", ""))
+        org_name = st.text_input("Nama Organisasi", value=plc_prefill.get("org_name", ""))
+        org_addr = st.text_area("Alamat Organisasi", value=plc_prefill.get("address", ""))
+        contact_person = st.text_input("Penyelia Industri (Nama)", value=plc_prefill.get("contact_person", ""))
+        contact_email  = st.text_input("Emel Penyelia Industri", value=plc_prefill.get("contact_email", ""))
+        contact_phone  = st.text_input("Telefon Penyelia Industri", value=plc_prefill.get("contact_phone", ""))
         hantar_bli03   = st.form_submit_button("Simpan BLI-03")
 
     if hantar_bli03:
-        if not org_name:
+        if not org_name.strip():
             st.error("Nama organisasi wajib diisi.")
         else:
             with get_conn() as conn:
@@ -162,12 +171,13 @@ with tabs[1]:
                     INSERT INTO placements
                     (student_id, org_name, address, contact_person, contact_email, contact_phone, term_id, created_at)
                     VALUES (?,?,?,?,?,?,?, datetime('now'))
-                """, (user["user_id"], org_name, org_addr, contact_person, contact_email, contact_phone, term_id))
+                """, (user["user_id"], org_name.strip(), org_addr.strip(), contact_person.strip(),
+                      contact_email.strip(), contact_phone.strip(), term_id))
                 conn.commit()
             st.success("BLI-03 disimpan.")
             st.rerun()
 
-# --- BLI-04 (Lapor Diri, online)
+# --- BLI-04 (Lapor Diri)
 with tabs[2]:
     st.caption("Sahkan lapor diri di organisasi (sekali untuk sesi ini).")
     with get_conn() as conn:
@@ -194,13 +204,10 @@ st.divider()
 # -------------------- Logbook Mingguan --------------------
 st.markdown("## 📒 Logbook Mingguan")
 
-with get_conn() as conn:
-    df_term = pd.read_sql_query(
-        "SELECT term_id, session_label, start_date FROM terms ORDER BY term_id DESC LIMIT 1", conn
-    )
+# Guna start_date jika diperlukan (opsyenal)
 term_start = None
 try:
-    if df_term.iloc[0]["start_date"]:
+    if not df_term.empty and df_term.iloc[0]["start_date"]:
         term_start = dt.strptime(df_term.iloc[0]["start_date"], "%Y-%m-%d").date()
 except Exception:
     term_start = None
@@ -296,7 +303,6 @@ with get_conn() as conn:
     )
     b1 = {}
     if not df_b1.empty and df_b1["data_json"].iloc[0]:
-        import json
         try:
             b1 = json.loads(df_b1["data_json"].iloc[0]) or {}
         except Exception:
@@ -306,7 +312,7 @@ with get_conn() as conn:
            FROM placements WHERE student_id=? AND term_id=? ORDER BY id DESC LIMIT 1""",
         conn, params=(user["user_id"], term_id)
     )
-    plc = df_p.iloc[0].to_dict() if not df_p.empty else {}
+    plc_data = df_p.iloc[0].to_dict() if not df_p.empty else {}
 
 today_str = datetime.date.today().strftime("%d %b %Y")
 mapping_base = {
@@ -324,11 +330,11 @@ mapping_base = {
 mapping_sli3 = {
     **mapping_base,
     # BLI-03
-    "ORG": plc.get("org_name", ""),
-    "ORG_ADDR": plc.get("address", ""),
-    "ORG_PIC": plc.get("contact_person", ""),
-    "ORG_EMAIL": plc.get("contact_email", ""),
-    "ORG_PHONE": plc.get("contact_phone", ""),
+    "ORG": plc_data.get("org_name", ""),
+    "ORG_ADDR": plc_data.get("address", ""),
+    "ORG_PIC": plc_data.get("contact_person", ""),
+    "ORG_EMAIL": plc_data.get("contact_email", ""),
+    "ORG_PHONE": plc_data.get("contact_phone", ""),
 }
 
 need_bli01 = not mapping_base["ALAMAT"]  # anggap alamat wajib utk SLI01
@@ -362,6 +368,7 @@ with c2:
             st.error(f"Gagal jana Surat Penempatan: {e}")
 
 # -------------------- Logout --------------------
+st.divider()
 if st.button("Log Keluar"):
     st.session_state.auth = None
     st.rerun()
