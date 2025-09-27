@@ -12,8 +12,12 @@ from lib.common import (
 from io import BytesIO
 from docx import Document  # pip install python-docx
 
-# HANYA token eksplisit: «KEY» dan {{KEY}} (TIADA raw-key!)
-TOKEN_FORMS = (lambda k: f"«{k}»", lambda k: f"{{{{{k}}}}}")
+# HANYA token eksplisit: «KEY», {{KEY}}, <<KEY>>  (TIADA raw-key!)
+TOKEN_FORMS = (
+    lambda k: f"«{k}»",          # guillemet
+    lambda k: f"{{{{{k}}}}}",    # double-curly
+    lambda k: f"<<{k}>>",        # ASCII double-angle
+)
 
 def _replace_in_paragraph(p, repl: dict):
     txt = p.text or ""
@@ -99,6 +103,18 @@ def ensure_upload_tables():
         conn.commit()
 
 ensure_upload_tables()  # panggil awal
+
+# ---- MIGRASI: tambah lajur week_no pada logbook jika belum ada
+def ensure_logbook_has_week():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(logbook)")
+        cols = {r[1] for r in cur.fetchall()}
+        if "week_no" not in cols:
+            cur.execute("ALTER TABLE logbook ADD COLUMN week_no INTEGER")
+            conn.commit()
+
+ensure_logbook_has_week()
 
 # Helper: baca SQL yang kalis jadual/kolum hilang
 def safe_read_sql(conn, sql, params=(), empty_cols=None):
@@ -319,7 +335,7 @@ with tabs[3]:
             cur.execute("""
                 INSERT INTO reporting_in(student_id, term_id, reported_at, file_name, file_blob)
                 VALUES (?,?, datetime('now'), ?, ?)
-            """, (user['user_id'], term_id, up_bli04.name, blob))
+            """, (user["user_id"], term_id, up_bli04.name, blob))
             conn.commit()
         st.success("BLI-04 berjaya dimuat naik."); st.rerun()
 
@@ -354,18 +370,30 @@ st.divider()
 # ============================ Logbook Mingguan ===============================
 st.markdown("## 📒 Logbook Mingguan")
 
+# kira minggu semasa (anggaran) dari tarikh term mula
+def _suggest_week(today: date, term_start_str: str):
+    try:
+        ts = dt.strptime(term_start_str, "%Y-%m-%d").date()
+        delta = (today - ts).days
+        w = 1 + (delta // 7)
+        return max(1, min(16, w))
+    except Exception:
+        return 1
+
 with get_conn() as conn:
     df_logs = pd.read_sql_query("""
-        SELECT log_id, entry_date, title, activities, outcomes, hours,
+        SELECT log_id, week_no, entry_date, title, activities, outcomes, hours,
                COALESCE(acad_comment,'') AS acad_comment,
                COALESCE(ind_comment,'')  AS ind_comment
         FROM logbook
         WHERE student_id=? AND term_id=?
-        ORDER BY entry_date DESC
+        ORDER BY COALESCE(week_no, 999), entry_date DESC
     """, conn, params=(user["user_id"], term_id))
 
 with st.form("form_logbook"):
-    c1, c2 = st.columns([1, 1])
+    c0, c1, c2 = st.columns([1,1,1])
+    week_no = c0.selectbox("Minggu ke-", list(range(1, 17)),
+                           index=_suggest_week(date.today(), df_term.iloc[0].get("start_date"))-1)
     entry_date = c1.date_input("Tarikh aktiviti", value=date.today())
     hours = c2.number_input("Jumlah jam (hari tersebut)", min_value=0.0, max_value=12.0, step=0.5, value=0.0)
     title = st.text_input("Ringkasan tajuk / Fokus mingguan", value="")
@@ -379,6 +407,7 @@ if submit_log:
     else:
         with get_conn() as conn:
             cur = conn.cursor()
+            # Cari entri sama tarikh (logik sedia ada), tetapi kini simpan juga week_no
             cur.execute("""
                 SELECT log_id, acad_comment, ind_comment
                 FROM logbook
@@ -387,23 +416,23 @@ if submit_log:
             row = cur.fetchone()
 
             def commented(r):
-                return bool(r and ((r[1] and r[1].strip()) or (r[2] and r[2].strip())))
+                return bool(r and ((r[1] and str(r[1]).strip()) or (r[2] and str(r[2]).strip())))
 
             if row and commented(row):
                 st.info("Entri pada tarikh ini telah menerima komen penyelia dan tidak boleh diubah.")
             elif row:
                 cur.execute("""
                     UPDATE logbook
-                    SET title=?, activities=?, outcomes=?, hours=?
+                    SET week_no=?, title=?, activities=?, outcomes=?, hours=?
                     WHERE log_id=?
-                """, (title.strip(), activities.strip(), outcomes.strip(), float(hours), int(row[0])))
+                """, (int(week_no), title.strip(), activities.strip(), outcomes.strip(), float(hours), int(row[0])))
                 conn.commit()
                 st.success("Logbook dikemas kini."); st.rerun()
             else:
                 cur.execute("""
-                    INSERT INTO logbook(student_id, term_id, entry_date, title, activities, outcomes, hours, created_at)
-                    VALUES (?,?,?,?,?,?,?, datetime('now'))
-                """, (user["user_id"], term_id, entry_date.isoformat(),
+                    INSERT INTO logbook(student_id, term_id, week_no, entry_date, title, activities, outcomes, hours, created_at)
+                    VALUES (?,?,?,?,?,?,?,?, datetime('now'))
+                """, (user["user_id"], term_id, int(week_no), entry_date.isoformat(),
                       title.strip(), activities.strip(), outcomes.strip(), float(hours)))
                 conn.commit()
                 st.success("Logbook disimpan."); st.rerun()
@@ -413,14 +442,15 @@ if df_logs.empty:
     st.info("Belum ada entri logbook.")
 else:
     def status_komen(r):
-        a = bool(r["acad_comment"].strip()); i = bool(r["ind_comment"].strip())
+        a = bool(str(r["acad_comment"]).strip()); i = bool(str(r["ind_comment"]).strip())
         if a and i: return "✅ Akademik & Industri"
         if a:       return "✅ Akademik"
         if i:       return "✅ Industri"
         return "– Tiada komen"
     show = df_logs.copy()
     show["Status Komen"] = show.apply(status_komen, axis=1)
-    show = show[["entry_date", "title", "hours", "Status Komen"]]
+    show = show[["week_no", "entry_date", "title", "hours", "Status Komen"]]
+    show = show.rename(columns={"week_no": "Minggu"})
     st.dataframe(show, use_container_width=True)
 
 st.divider()
@@ -462,16 +492,15 @@ alamat_val   = (b1.get("alamat") or "")
 guardian_val = (b1.get("guardian") or "")
 guardian_tel_val = (b1.get("guardian_tel") or "")
 
-# Mapping SLI-01: ikut token legasi (chevron) + {{double-curly}} jika ada
+# ---------------------- SLI-01 ----------------------
 mapping_sli01 = {
-    # token legasi (chevron)
+    # token legasi (chevron) & {{...}} jika ada
     "NAMA_PENUH_HURUF_BESAR": student_name.upper(),
     "NOMBOR_KAD_PENGENALAN":  noic_val,
     "NOMBOR_ID_PELAJAR":      u["student_id"] or "",
     "NAMA_PROGRAM":           program_val,
     "TARIKH_MULA_LI":         _fmt(df_term.iloc[0].get("start_date")),
     "TARIKH_TAMAT_LI":        _fmt(df_term.iloc[0].get("end_date")),
-    # jika template anda juga ada versi {{...}} (kod sokong kedua-dua)
     "NAMA":                   student_name,
     "NOPELAJAR":              u["student_id"] or "",
     "PROGRAM":                program_val,
@@ -499,12 +528,10 @@ else:
     try:
         buf_perm = fill_docx(tmpl_perm, mapping_sli01)
         binary_doc = buf_perm.getvalue()
-
         if can_dl_sli01:
             st.success("SLI01: Sedia dijana. " + msg)
         else:
             st.info("SLI01: " + msg)
-
         st.download_button(
             "✨ Muat Turun Surat Permohonan (Auto-isi)",
             data=binary_doc,
@@ -517,36 +544,54 @@ else:
         st.error("Gagal jana SLI-01.")
         st.code(traceback.format_exc())
 
-# SLI-03 (download) — memerlukan sekurang-kurangnya Nama Organisasi
-map_sli3 = {
-    "NAMA": student_name,
-    "NOPELAJAR": u["student_id"] or "",
-    "PROGRAM": program_val,
-    "TARIKH": today_str,
-    "ALAMAT": alamat_val,
-    "NOIC": noic_val,
-    "NOTEL": notel_val,
-    "GUARDIAN": guardian_val,
-    "GUARDIAN_TEL": guardian_tel_val,
-    "TARIKH_MULA_LI": _fmt(df_term.iloc[0].get("start_date")),
-    "TARIKH_TAMAT_LI": _fmt(df_term.iloc[0].get("end_date")),
-    "ORG": plc_data.get("org_name", ""),
-    "ORG_ADDR": plc_data.get("address", ""),
-    "ORG_PIC": plc_data.get("contact_person", ""),
-    "ORG_EMAIL": plc_data.get("contact_email", ""),
-    "ORG_PHONE": plc_data.get("contact_phone", ""),
+# ---------------------- SLI-03 ----------------------
+def _split_address_two_lines(addr: str):
+    if not addr: return "", ""
+    parts = [p.strip() for p in addr.replace("\n", ", ").split(",") if p.strip()]
+    if len(parts) <= 1:
+        return (parts[0] if parts else "", "")
+    cut = max(1, len(parts)//2)
+    return ", ".join(parts[:cut]), ", ".join(parts[cut:])
+
+org_name   = plc_data.get("org_name", "")
+org_addr_1, org_addr_2 = _split_address_two_lines(plc_data.get("address", ""))
+
+# Peta ikut token <<...>> yang lazim pada templat SLI-03
+mapping_sli3 = {
+    # pelajar
+    "NAMA_PELAJAR": student_name,
+    "NO_KAD_PENGENALAN": noic_val,
+    "NO_PELAJAR": u["student_id"] or "",
+    "NAMA_PROGRAM": program_val,
+
+    # tarikh LI
+    "TARIKH_MULA_LATIHAN_INDUSTRI": _fmt(df_term.iloc[0].get("start_date")),
+    "TARIKH_TAMAT_LATIHAN_INDUSTRI": _fmt(df_term.iloc[0].get("end_date")),
+
+    # organisasi
+    "NAMA_ORGANISASI": org_name,
+    "ALAMAT_ORGANISASI_1": org_addr_1,
+    "ALAMAT_ORGANISASI_2": org_addr_2,
+    "BANDAR": "",
+    "POSKOD": "",
+    "NEGERI": "",
+
+    # penyelaras (boleh tukar ikut kampus)
+    "NAMA_PENYELARAS": "AZ’LINA BINTI ABDUL HADI",
+    "JAWATAN_PENYELARAS": "Penyelaras Latihan Industri",
+    "TELEFON_PENYELARAS": "012-3456789",
+    "EMEL_PENYELARAS": "azlina_hadi@uitm.edu.my",
 }
-need_bli03 = not (plc_data.get("org_name") or "").strip()
+
+need_bli03 = not (org_name or "").strip()
 
 if not os.path.exists(tmpl_sli3):
     st.error("Template SLI-03 tidak ditemui. Letak di `templates/SLI03_Surat_Penempatan.docx`.")
 else:
     try:
-        buf_sli3 = fill_docx(tmpl_sli3, map_sli3)
-
+        buf_sli3 = fill_docx(tmpl_sli3, mapping_sli3)
         if need_bli03:
             st.info("Lengkapkan **BLI-03** (Nama Organisasi) untuk auto-isi Surat Penempatan.")
-
         st.download_button(
             "✨ Muat Turun Surat Penempatan (Auto-isi)",
             data=buf_sli3.getvalue(),
