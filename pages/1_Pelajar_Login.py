@@ -1,6 +1,7 @@
-# pages/1_Pelajar_Login.py  —  versi baharu
+# pages/1_Pelajar_Login.py
 import os
 import datetime
+from datetime import date, datetime as dt
 import pandas as pd
 import streamlit as st
 
@@ -9,16 +10,15 @@ from lib.common import (
     get_conn, one, term_label, render_docx_from_template
 )
 
-# ---------- Setup & DB init ----------
+# -------------------- Setup & DB init --------------------
 st.set_page_config(page_title="Log Masuk Pelajar", page_icon="🎓", layout="wide")
 st.title("Log Masuk Pelajar")
 
-# Pastikan fail SQL dirujuk guna path mutlak (elak 'not found')
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SQL_PATH = os.path.join(BASE_DIR, "..", "init_mytimes_fyp.sql")
 
 try:
-    ensure_db(SQL_PATH)
+    ensure_db(SQL_PATH)  # make sure DB exists and schema is loaded
 except Exception as e:
     st.error(f"Ralat DB: {e}")
     st.stop()
@@ -26,7 +26,7 @@ except Exception as e:
 if "auth" not in st.session_state:
     st.session_state.auth = None
 
-# ---------- Login ----------
+# -------------------- Login --------------------
 if not st.session_state.auth:
     with st.form("login"):
         login_text = st.text_input("Emel / No. Pelajar")
@@ -43,11 +43,11 @@ if not st.session_state.auth:
             st.rerun()
     st.stop()
 
-# ---------- Selepas login ----------
+# -------------------- Selepas login --------------------
 user = st.session_state.auth
 st.success(f"Log masuk sebagai {user['full_name']} ({user.get('program_code') or '-'})")
 
-# Meter ringkas
+# Metrics ringkas
 with get_conn() as conn:
     tlabel = term_label(conn)
     bli01 = one(conn, "SELECT COUNT(1) FROM bli01 WHERE student_id=?", (user['user_id'],))
@@ -74,7 +74,7 @@ col9.metric("BLI-08 (Akademik)", "✅" if aca else "❌")
 
 st.divider()
 
-# ---------- Borang atas talian: BLI-01 / BLI-03 / BLI-04 ----------
+# -------------------- Borang Atas Talian --------------------
 st.markdown("## 📝 Borang Atas Talian")
 tabs = st.tabs([
     "BLI-01 Maklumat Peribadi",
@@ -88,7 +88,7 @@ with get_conn() as conn:
         "SELECT term_id FROM terms ORDER BY term_id DESC LIMIT 1", conn
     ).iloc[0]["term_id"]
 
-# --- BLI-01
+# --- BLI-01 (Maklumat Peribadi, online)
 with tabs[0]:
     st.caption("Isi maklumat peribadi. Boleh kemas kini sebelum tarikh tutup.")
     with get_conn() as conn:
@@ -132,7 +132,7 @@ with tabs[0]:
         st.success("BLI-01 disimpan.")
         st.rerun()
 
-# --- BLI-03
+# --- BLI-03 (Pengesahan Penempatan, online)
 with tabs[1]:
     st.caption("Isi butiran penempatan praktikal/industri.")
     with get_conn() as conn:
@@ -167,7 +167,7 @@ with tabs[1]:
             st.success("BLI-03 disimpan.")
             st.rerun()
 
-# --- BLI-04
+# --- BLI-04 (Lapor Diri, online)
 with tabs[2]:
     st.caption("Sahkan lapor diri di organisasi (sekali untuk sesi ini).")
     with get_conn() as conn:
@@ -191,10 +191,8 @@ with tabs[2]:
 
 st.divider()
 
-# ---------- Logbook Mingguan ----------
+# -------------------- Logbook Mingguan --------------------
 st.markdown("## 📒 Logbook Mingguan")
-
-from datetime import date, datetime as dt
 
 with get_conn() as conn:
     df_term = pd.read_sql_query(
@@ -280,73 +278,90 @@ else:
 
 st.divider()
 
-# ---------- Surat: Download & Auto-Generate ----------
-st.markdown("## 📄 Muat Turun & Auto-Generate Surat")
-
-def _readb(p):
-    try:
-        with open(p, "rb") as fh:
-            return fh.read()
-    except Exception:
-        return None
+# -------------------- Surat: Auto-Generate dari BLI-01 & BLI-03 --------------------
+st.markdown("## 📄 Surat Permohonan & Penempatan (Auto-isi)")
 
 tmpl_perm = os.path.join(BASE_DIR, "..", "templates", "SLI01_Surat_Permohonan.docx")
 tmpl_sli3 = os.path.join(BASE_DIR, "..", "templates", "SLI03_Surat_Penempatan.docx")
 
-c1, c2 = st.columns(2)
-with c1:
-    b1 = _readb(tmpl_perm)
-    if b1:
-        st.download_button("⬇️ Download Surat Permohonan (Kosong)", b1,
-                           file_name="SLI01_Surat_Permohonan.docx")
-    else:
-        st.warning("Template SLI01 tak jumpa. Letak di templates/SLI01_Surat_Permohonan.docx")
-with c2:
-    b2 = _readb(tmpl_sli3)
-    if b2:
-        st.download_button("⬇️ Download Surat Penempatan (Kosong)", b2,
-                           file_name="SLI03_Surat_Penempatan.docx")
-    else:
-        st.warning("Template SLI-03 tak jumpa. Letak di templates/SLI03_Surat_Penempatan.docx")
-
-st.markdown("#### ✨ Auto-Generate (Isi Automatik)")
+# Kumpul data: profil, BLI-01 (data_json), BLI-03 (placements terkini)
 with get_conn() as conn:
-    df_u = pd.read_sql_query(
+    u = pd.read_sql_query(
         "SELECT full_name, student_id, program_code FROM users WHERE user_id=?",
         conn, params=(user["user_id"],)
+    ).iloc[0]
+    df_b1 = pd.read_sql_query(
+        "SELECT data_json FROM bli01 WHERE student_id=? AND term_id=? ORDER BY id DESC LIMIT 1",
+        conn, params=(user["user_id"], term_id)
     )
-    full_name, s_id, prog = df_u.iloc[0].tolist()
-    df_org = pd.read_sql_query(
-        "SELECT org_name FROM placements WHERE student_id=? ORDER BY id DESC LIMIT 1",
-        conn, params=(user["user_id"],)
+    b1 = {}
+    if not df_b1.empty and df_b1["data_json"].iloc[0]:
+        import json
+        try:
+            b1 = json.loads(df_b1["data_json"].iloc[0]) or {}
+        except Exception:
+            b1 = {}
+    df_p = pd.read_sql_query(
+        """SELECT org_name, address, contact_person, contact_email, contact_phone
+           FROM placements WHERE student_id=? AND term_id=? ORDER BY id DESC LIMIT 1""",
+        conn, params=(user["user_id"], term_id)
     )
-    org_name = df_org["org_name"].iloc[0] if not df_org.empty else ""
+    plc = df_p.iloc[0].to_dict() if not df_p.empty else {}
 
-today = datetime.date.today().strftime("%d %b %Y")
-mapping_base = {"NAMA": full_name, "NOPELAJAR": s_id or "", "PROGRAM": prog or "", "TARIKH": today}
-mapping_sli3 = dict(mapping_base, **{"ORG": org_name or ""})
+today_str = datetime.date.today().strftime("%d %b %Y")
+mapping_base = {
+    "NAMA": u["full_name"],
+    "NOPELAJAR": u["student_id"] or "",
+    "PROGRAM": u["program_code"] or "",
+    "TARIKH": today_str,
+    # BLI-01
+    "ALAMAT": b1.get("alamat", ""),
+    "NOIC": b1.get("no_ic", ""),
+    "NOTEL": b1.get("no_tel", ""),
+    "GUARDIAN": b1.get("guardian", ""),
+    "GUARDIAN_TEL": b1.get("guardian_tel", ""),
+}
+mapping_sli3 = {
+    **mapping_base,
+    # BLI-03
+    "ORG": plc.get("org_name", ""),
+    "ORG_ADDR": plc.get("address", ""),
+    "ORG_PIC": plc.get("contact_person", ""),
+    "ORG_EMAIL": plc.get("contact_email", ""),
+    "ORG_PHONE": plc.get("contact_phone", ""),
+}
 
-cA, cB = st.columns(2)
-with cA:
-    try:
-        b = render_docx_from_template(tmpl_perm, mapping_base)
-        st.download_button("✨ Auto-Generate Surat Permohonan (SLI01)", b,
-                           file_name=f"SLI01_{s_id}.docx")
-    except Exception:
-        st.info("Sediakan template SLI01 dengan placeholder {{NAMA}}, {{NOPELAJAR}}, {{PROGRAM}}, {{TARIKH}}.")
+need_bli01 = not mapping_base["ALAMAT"]  # anggap alamat wajib utk SLI01
+need_bli03 = not mapping_sli3["ORG"]     # organisasi wajib utk SLI-03
 
-with cB:
-    if org_name:
+c1, c2 = st.columns(2)
+with c1:
+    if not os.path.exists(tmpl_perm):
+        st.error("Template SLI01 tidak ditemui. Letak di `templates/SLI01_Surat_Permohonan.docx`.")
+    elif need_bli01:
+        st.warning("Lengkapkan BLI-01 dahulu (alamat/IC/telefon) untuk auto-isi Surat Permohonan.")
+    else:
+        try:
+            b = render_docx_from_template(tmpl_perm, mapping_base)
+            st.download_button("✨ Muat Turun Surat Permohonan (Auto-isi)", b,
+                               file_name=f"SLI01_{u['student_id']}.docx", type="primary")
+        except Exception as e:
+            st.error(f"Gagal jana Surat Permohonan: {e}")
+
+with c2:
+    if not os.path.exists(tmpl_sli3):
+        st.error("Template SLI-03 tidak ditemui. Letak di `templates/SLI03_Surat_Penempatan.docx`.")
+    elif need_bli03:
+        st.warning("Lengkapkan BLI-03 dahulu (organisasi/penyelia industri) untuk auto-isi Surat Penempatan.")
+    else:
         try:
             b = render_docx_from_template(tmpl_sli3, mapping_sli3)
-            st.download_button("✨ Auto-Generate Surat Penempatan (SLI-03)", b,
-                               file_name=f"SLI03_{s_id}.docx")
-        except Exception:
-            st.info("Sediakan template SLI-03 dengan placeholder termasuk {{ORG}}.")
-    else:
-        st.info("Surat Penempatan diaktifkan selepas maklumat organisasi wujud (BLI-03).")
+            st.download_button("✨ Muat Turun Surat Penempatan (Auto-isi)", b,
+                               file_name=f"SLI03_{u['student_id']}.docx", type="primary")
+        except Exception as e:
+            st.error(f"Gagal jana Surat Penempatan: {e}")
 
-# ---------- Logout ----------
+# -------------------- Logout --------------------
 if st.button("Log Keluar"):
     st.session_state.auth = None
     st.rerun()
