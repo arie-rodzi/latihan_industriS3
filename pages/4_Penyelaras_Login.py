@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 from lib.common import ensure_db, auth_email_or_sid, get_conn, one, term_label
 
-# ========== Setup asas ==========
+# ========== Setup ==========
 st.set_page_config(page_title="Penyelaras", page_icon="⚙️", layout="wide")
 st.title("Dashboard Penyelaras")
 
@@ -14,7 +14,7 @@ try:
 except Exception as e:
     st.error(f"Ralat DB: {e}"); st.stop()
 
-# Guard peranan
+# Login/Guard
 if "auth" not in st.session_state: st.session_state.auth = None
 if not st.session_state.auth:
     st.subheader("Log Masuk Penyelaras")
@@ -31,24 +31,18 @@ if not st.session_state.auth:
     st.stop()
 
 user = st.session_state.auth
-if user.get("role_name")!="coordinator":
-    st.error("Akses tidak dibenarkan. Hanya Penyelaras."); st.stop()
-
-# Program yang diselia oleh penyelaras ini
 program_managed = user.get("program_code") or "-"
 st.success(f"Log masuk sebagai {user['full_name']} — Program: **{program_managed}**")
 
 # Term aktif
 with get_conn() as conn:
-    df_term = pd.read_sql_query(
-        "SELECT term_id, session_label FROM terms ORDER BY term_id DESC LIMIT 1", conn
-    )
+    df_term = pd.read_sql_query("SELECT term_id, session_label FROM terms ORDER BY term_id DESC LIMIT 1", conn)
 if df_term.empty:
     st.warning("Tiada term aktif."); st.stop()
 term_id = int(df_term.iloc[0]["term_id"])
 st.info(f"Sesi semasa: **{df_term.iloc[0]['session_label']}**")
 
-# ========== Migrasi ringan: tambah lajur class_section pada users kalau tiada ==========
+# Pastikan kolum class_section wujud (migrasi ringan)
 def ensure_users_has_class_section():
     with get_conn() as conn:
         cur = conn.cursor()
@@ -59,15 +53,31 @@ def ensure_users_has_class_section():
             conn.commit()
 ensure_users_has_class_section()
 
-# Util CSV
+# Util CSV (tanpa xlsxwriter)
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue().encode("utf-8")
+    buf = io.StringIO(); df.to_csv(buf, index=False); return buf.getvalue().encode("utf-8")
+
+def read_any_table(uploaded_file) -> pd.DataFrame:
+    if uploaded_file is None: return pd.DataFrame()
+    name = (uploaded_file.name or "").lower()
+    try:
+        if name.endswith(".csv"):
+            return pd.read_csv(uploaded_file)
+        try:
+            import openpyxl  # jika ada, benarkan .xlsx
+            return pd.read_excel(uploaded_file)
+        except Exception:
+            uploaded_file.seek(0); return pd.read_csv(uploaded_file)
+    except Exception as e:
+        st.error(f"Gagal baca fail: {e}"); return pd.DataFrame()
+
+def require_cols(df: pd.DataFrame, cols: list[str]) -> tuple[bool, str]:
+    missing = [c for c in cols if c not in df.columns]
+    return (len(missing)==0, ", ".join(missing))
 
 st.divider()
 
-# ========== Senarai Kelas (section) bagi program penyelaras ==========
+# ====================== Senarai kelas sedia ada (daripada DB pendaftaran) ======================
 with get_conn() as conn:
     df_sections = pd.read_sql_query("""
         SELECT class_section, COUNT(1) AS bil
@@ -77,19 +87,128 @@ with get_conn() as conn:
         ORDER BY class_section
     """, conn, params=(program_managed,))
 if df_sections.empty:
-    st.warning("Belum ada `class_section` diisi untuk pelajar program ini. Sila kemas kini medan kelas (contoh: CS2417A, CS2417B).")
-    # Masih benarkan lihat semua pelajar program — tanpa tapis kelas
-    sections = ["(SEMUA)"]
-else:
-    sections = ["(SEMUA)"] + df_sections["class_section"].tolist()
+    st.error("Tiada kelas ditemui untuk program ini. Pastikan pelajar program ini mempunyai `class_section` semasa pendaftaran.")
+    st.stop()
 
-kelas = st.selectbox("Pilih kelas (section)", sections, index=0)
+kelas_list = df_sections["class_section"].tolist()
+kelas = st.selectbox("Pilih kelas (section)", kelas_list, index=0)
 
-# Penapis SQL kelas
-cls_filter = "" if kelas=="(SEMUA)" else " AND u.class_section=? "
-cls_params = () if kelas=="(SEMUA)" else (kelas,)
+cls_filter = " AND u.class_section=? "
+cls_params = (kelas,)
 
-# ========== 1) Senarai Pelajar 30 orang per kelas (roster) ==========
+# ====================== Upload pensyarah akademik & matching kelas ======================
+st.header("🧑‍🏫 Muat Naik Pensyarah Akademik & Padan (Kelas terpilih)")
+st.caption("**Templat CSV/XLSX**: lajur **sv_email,full_name,max_students** (max_students opsyenal). Program akan diambil sebagai **"
+           + program_managed + "** mengikut akaun penyelaras.")
+
+tmpl_sv = pd.DataFrame({"sv_email":[],"full_name":[],"max_students":[]})
+st.download_button("📥 Muat turun templat Pensyarah (CSV)",
+                   data=df_to_csv_bytes(tmpl_sv),
+                   file_name=f"template_pensyarah_{program_managed}.csv",
+                   mime="text/csv")
+
+up_acad = st.file_uploader("Muat naik senarai pensyarah (CSV/XLSX)", key="acad_csv")
+df_acad = read_any_table(up_acad)
+if not df_acad.empty:
+    ok, miss = require_cols(df_acad, ["sv_email","full_name"])
+    if not ok:
+        st.error(f"Lajur wajib tiada: {miss}")
+        df_acad = pd.DataFrame()
+    else:
+        if "max_students" not in df_acad.columns: df_acad["max_students"] = None
+        st.success(f"Pensyarah dimuat: {len(df_acad)} baris")
+        st.dataframe(df_acad, use_container_width=True, hide_index=True)
+
+def get_or_create_user(email, full_name, role_id, program_code=None):
+    import hashlib
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE email=?", (email,))
+        r = cur.fetchone()
+        if r: return int(r[0])
+        ph = hashlib.sha256("DEFAULT123".encode()).hexdigest()
+        cur.execute("""
+            INSERT INTO users(full_name, email, role_id, program_code, password_hash, is_active)
+            VALUES (?,?,?,?,?,1)
+        """, (full_name, email, role_id, program_code, ph))
+        conn.commit()
+        return cur.lastrowid
+
+if st.button("⚖️ Jana & Simpan Padanan Akademik (untuk kelas ini)"):
+    # Ambil pelajar kelas terpilih
+    with get_conn() as conn:
+        sql_stu = """
+          SELECT user_id, student_id, full_name
+          FROM users u
+          WHERE u.role_id=1 AND u.program_code=? AND u.class_section=?
+          ORDER BY u.student_id
+        """
+        df_students = pd.read_sql_query(sql_stu, conn, params=(program_managed, kelas))
+
+    if df_students.empty:
+        st.warning("Tiada pelajar untuk dipadankan dalam kelas ini.")
+    elif df_acad.empty:
+        st.warning("Muat naik senarai pensyarah dahulu.")
+    else:
+        df_sv = df_acad.copy()
+        df_sv["max_students"] = pd.to_numeric(df_sv["max_students"], errors="coerce").fillna(999).astype(int)
+        df_sv["assigned"] = 0
+        if df_sv.empty:
+            st.warning("Senarai pensyarah kosong.")
+        else:
+            # Buang assignment akademik lama untuk pelajar kelas ini pada term ini
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    DELETE FROM supervisor_assignments
+                    WHERE term_id=? AND program_code=? AND student_user_id IN (
+                        SELECT user_id FROM users WHERE role_id=1 AND program_code=? AND class_section=?
+                    )
+                """, (term_id, program_managed, program_managed, kelas))
+                conn.commit()
+
+            # Round-robin
+            assigned = []
+            idx = 0; n = len(df_sv)
+            for _, s in df_students.reset_index(drop=True).iterrows():
+                tries = 0
+                while tries < n and df_sv.iloc[idx]["assigned"] >= df_sv.iloc[idx]["max_students"]:
+                    idx = (idx + 1) % n; tries += 1
+                sv = df_sv.iloc[idx]
+                assigned.append({
+                    "student_id": s["student_id"],
+                    "student_user_id": int(s["user_id"]),
+                    "acad_sv_email": sv["sv_email"],
+                    "acad_sv_name": sv["full_name"]
+                })
+                df_sv.at[df_sv.index[idx], "assigned"] += 1
+                idx = (idx + 1) % n
+
+            df_assigned = pd.DataFrame(assigned)
+
+            # Simpan ke DB
+            with get_conn() as conn:
+                cur = conn.cursor()
+                for _, r in df_assigned.iterrows():
+                    acad_id = get_or_create_user(r["acad_sv_email"], r["acad_sv_name"], 3, program_managed)
+                    cur.execute("""
+                        INSERT INTO supervisor_assignments(student_user_id, acad_sv_user_id, ind_sv_user_id, program_code, term_id, assigned_at)
+                        VALUES (?,?,?,?,?, datetime('now'))
+                    """, (int(r["student_user_id"]), acad_id, None, program_managed, term_id))
+                conn.commit()
+
+            st.success(f"Padanan disimpan untuk kelas {kelas}.")
+            st.download_button(
+                "⬇️ Muat turun CSV padanan",
+                data=df_to_csv_bytes(df_assigned[["student_id","acad_sv_email","acad_sv_name"]]),
+                file_name=f"padanan_akademik_{program_managed}_{kelas.replace(' ','_')}.csv",
+                mime="text/csv"
+            )
+            st.rerun()
+
+st.divider()
+
+# ====================== Roster kelas (data sedia ada) ======================
 st.header("👥 Senarai Pelajar (mengikut kelas)")
 
 with get_conn() as conn:
@@ -117,7 +236,7 @@ with get_conn() as conn:
     df_roster = pd.read_sql_query(sql_roster, conn, params=params)
 
 if df_roster.empty:
-    st.info("Tiada pelajar ditemui untuk pilihan ini.")
+    st.error("Tiada pelajar ditemui untuk kelas ini. Sahkan data pendaftaran (class_section) memang wujud.")
 else:
     st.caption(f"Bilangan pelajar: **{len(df_roster)}**")
     st.dataframe(df_roster[["no_pelajar","nama_pelajar","program","kelas","organisasi","penyelia_industri","penyelia_akademik"]],
@@ -131,42 +250,39 @@ else:
 
 st.divider()
 
-# ========== 2) Senarai Penyelia Industri untuk kelas terpilih ==========
+# ====================== Senarai Penyelia Industri (kelas terpilih) ======================
 st.header("🏭 Senarai Penyelia Industri (kelas terpilih)")
 
-if df_roster.empty:
-    st.info("Tiada data untuk dipapar.")
-else:
-    with get_conn() as conn:
-        sql_indlist = f"""
-            SELECT 
-              COALESCE(ind.full_name,'(tiada)') AS nama_penyelia_industri,
-              COALESCE(ind.email,'-')          AS emel_penyelia_industri,
-              COUNT(1) AS bil_pelajar
-            FROM users u
-            LEFT JOIN supervisor_assignments sa 
-              ON sa.student_user_id=u.user_id AND sa.term_id=?
-            LEFT JOIN users ind ON ind.user_id=sa.ind_sv_user_id
-            WHERE u.role_id=1 AND u.program_code=? {cls_filter}
-            GROUP BY ind.user_id, ind.full_name, ind.email
-            ORDER BY bil_pelajar DESC, nama_penyelia_industri
-        """
-        params = (term_id, program_managed) + cls_params
-        df_indlist = pd.read_sql_query(sql_indlist, conn, params=params)
-    st.dataframe(df_indlist, use_container_width=True, hide_index=True)
-    st.download_button(
-        "⬇️ Muat turun senarai penyelia industri (CSV)",
-        data=df_to_csv_bytes(df_indlist),
-        file_name=f"senarai_penyelia_industri_{program_managed}_{kelas.replace(' ','_')}.csv",
-        mime="text/csv"
-    )
+with get_conn() as conn:
+    sql_indlist = f"""
+        SELECT 
+          COALESCE(ind.full_name,'(tiada)') AS nama_penyelia_industri,
+          COALESCE(ind.email,'-')          AS emel_penyelia_industri,
+          COUNT(1) AS bil_pelajar
+        FROM users u
+        LEFT JOIN supervisor_assignments sa 
+          ON sa.student_user_id=u.user_id AND sa.term_id=?
+        LEFT JOIN users ind ON ind.user_id=sa.ind_sv_user_id
+        WHERE u.role_id=1 AND u.program_code=? {cls_filter}
+        GROUP BY ind.user_id, ind.full_name, ind.email
+        ORDER BY bil_pelajar DESC, nama_penyelia_industri
+    """
+    params = (term_id, program_managed) + cls_params
+    df_indlist = pd.read_sql_query(sql_indlist, conn, params=params)
+
+st.dataframe(df_indlist, use_container_width=True, hide_index=True)
+st.download_button(
+    "⬇️ Muat turun senarai penyelia industri (CSV)",
+    data=df_to_csv_bytes(df_indlist),
+    file_name=f"senarai_penyelia_industri_{program_managed}_{kelas.replace(' ','_')}.csv",
+    mime="text/csv"
+)
 
 st.divider()
 
-# ========== 3) Markah Semua Orang (ikut CLO) untuk kelas terpilih ==========
+# ====================== Markah (CLO) — semua pelajar dalam kelas ======================
 st.header("📊 Markah (CLO) — semua pelajar dalam kelas")
 
-# Helper: baca rekod terkini mengikut student_user_id
 def fetch_latest_ids(conn, table, key_student="student_user_id"):
     sql = f"""
         SELECT {key_student} AS user_id, MAX(id) AS last_id
@@ -205,69 +321,60 @@ with get_conn() as conn:
         """
         df_ind = pd.read_sql_query(sql, conn, params=ids)
 
-# Ambil senarai pelajar (kelas pilih) untuk merge
+# Senarai pelajar untuk merge
 df_students = df_roster[["user_id","no_pelajar","nama_pelajar","kelas"]].copy()
 
 # Gabung markah
 dfm = df_students.merge(df_acad, on="user_id", how="left").merge(df_ind, on="user_id", how="left")
 
-# Kira CLO Akademik (pemetaan default)
-# CLO1 = Komunikasi
-# CLO2 = Disiplin + Kehadiran
-# CLO3 = Kualiti Kerja
-# CLO4 = Inisiatif
+# Normalisasi numerik
 for col in ["score_komunikasi","score_disiplin","score_kualiti","score_kehadiran","score_inisiatif","total","ind_total"]:
-    if col in dfm.columns:
-        dfm[col] = pd.to_numeric(dfm[col], errors="coerce")
+    if col in dfm.columns: dfm[col] = pd.to_numeric(dfm[col], errors="coerce")
 
+# Pemetaan CLO Akademik (boleh ubah jika perlu)
 dfm["CLO1_Akad"] = dfm["score_komunikasi"]
 dfm["CLO2_Akad"] = dfm["score_disiplin"] + dfm["score_kehadiran"]
 dfm["CLO3_Akad"] = dfm["score_kualiti"]
 dfm["CLO4_Akad"] = dfm["score_inisiatif"]
 
-# Cuba baca CLO Industri dari details_json jika wujud
+# Extract CLO Industri dari details_json jika ada
 def extract_clo_from_json(s):
     try:
         if not s: return {}
         d = json.loads(s)
         out = {}
-        # Jika JSON guna kunci CLO1..CLO4
         for k, v in d.items():
-            if re.fullmatch(r"(?i)clo\s*([1-4])", str(k).replace("_"," ").strip()):
-                out[k.upper().replace(" ","")] = float(v) if isinstance(v, (int,float,str)) else None
-        # Atau kalau ada nested dict "clo": {"1":..}
+            kk = str(k).strip().upper().replace(" ","").replace("_","")
+            if kk in ["CLO1","CLO2","CLO3","CLO4"]:
+                try: out[kk] = float(v)
+                except: pass
         if not out and isinstance(d.get("clo", None), dict):
             for kk, vv in d["clo"].items():
                 key = f"CLO{kk}".upper()
-                try:
-                    out[key] = float(vv)
-                except Exception:
-                    pass
+                try: out[key] = float(vv)
+                except: pass
         return out
     except Exception:
         return {}
 
-clo_cols = ["CLO1_Ind","CLO2_Ind","CLO3_Ind","CLO4_Ind"]
-for c in clo_cols: dfm[c] = None
+for i in range(1,5):
+    dfm[f"CLO{i}_Ind"] = None
 if "details_json" in dfm.columns:
     for idx, row in dfm.iterrows():
         clo = extract_clo_from_json(row.get("details_json"))
         for i in range(1,5):
             key = f"CLO{i}"
-            if key in clo:
-                dfm.at[idx, f"CLO{i}_Ind"] = clo[key]
+            if key in clo: dfm.at[idx, f"CLO{i}_Ind"] = clo[key]
 
-# Papar jadual markah
+# Papar & download
 view_cols = [
     "no_pelajar","nama_pelajar","kelas",
     "CLO1_Akad","CLO2_Akad","CLO3_Akad","CLO4_Akad",
     "ind_total","CLO1_Ind","CLO2_Ind","CLO3_Ind","CLO4_Ind",
-    "total"  # total akademik (daripada BLI-08)
+    "total"
 ]
-# Jamin kolum wujud
 view_cols = [c for c in view_cols if c in dfm.columns]
 st.dataframe(dfm[view_cols], use_container_width=True, hide_index=True)
-
 st.download_button(
     "⬇️ Muat turun markah (CLO) kelas ini — CSV",
     data=df_to_csv_bytes(dfm[view_cols]),
